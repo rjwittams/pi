@@ -258,6 +258,7 @@ export class TUI extends Container {
 	private maxLinesRendered = 0; // Track terminal's working area (max lines ever rendered)
 	private previousViewportTop = 0; // Track previous viewport top for resize-aware cursor moves
 	private bufferLengthHighWater = 0; // Render pads up to this so viewportTop only grows until next resize
+	private previousRealLength = 0; // Last render's unpadded line count (for shrink-detection)
 	private fullRedrawCount = 0;
 	private stopped = false;
 
@@ -969,8 +970,13 @@ export class TUI extends Container {
 
 		// Render all components to get new lines
 		let newLines = this.render(width);
+		const realLength = newLines.length;
+		const prevRealLength = this.previousRealLength;
+		this.previousRealLength = realLength;
 
-		// Pad newLines up to the high-water buffer length so viewportTop only grows until resize.
+		// Pad newLines up to the high-water buffer length so viewportTop only grows
+		// until resize. Reset on resize; the shrink-detection paths below use realLength
+		// so they fire on real shrinks regardless of the padding.
 		if (widthChanged || heightChanged) {
 			this.bufferLengthHighWater = 0;
 		}
@@ -994,6 +1000,15 @@ export class TUI extends Container {
 
 		// Helper to clear scrollback and viewport and render all new lines
 		const fullRender = (clear: boolean): void => {
+			// A clearing redraw rebuilds the screen from scratch; the watermark cannot pin
+			// a viewport position that no longer matches the new content. Release it and
+			// emit only the real lines so the natural viewport reflects the actual buffer.
+			// Skip when overlays are active: compositeOverlays grows newLines past
+			// realLength to place overlay content; truncating would strip the overlays.
+			if (clear && newLines.length > realLength && this.overlayStack.length === 0) {
+				this.bufferLengthHighWater = realLength;
+				newLines.length = realLength;
+			}
 			this.fullRedrawCount += 1;
 			let buffer = "\x1b[?2026h"; // Begin synchronized output
 			if (clear) {
@@ -1008,11 +1023,12 @@ export class TUI extends Container {
 			this.terminal.write(buffer);
 			this.cursorRow = Math.max(0, newLines.length - 1);
 			this.hardwareCursorRow = this.cursorRow;
-			// Reset max lines when clearing, otherwise track growth
+			// Reset max real lines when clearing, otherwise track growth.
+			// Tracks real content size so clearOnShrink fires on real shrinks despite padding.
 			if (clear) {
-				this.maxLinesRendered = newLines.length;
+				this.maxLinesRendered = realLength;
 			} else {
-				this.maxLinesRendered = Math.max(this.maxLinesRendered, newLines.length);
+				this.maxLinesRendered = Math.max(this.maxLinesRendered, realLength);
 			}
 			const bufferLength = Math.max(height, newLines.length);
 			this.previousViewportTop = Math.max(0, bufferLength - height);
@@ -1057,7 +1073,7 @@ export class TUI extends Container {
 		// Content shrunk below the working area and no overlays - re-render to clear empty rows
 		// (overlays need the padding, so only do this when no overlays are active)
 		// Configurable via setClearOnShrink() or PI_CLEAR_ON_SHRINK=0 env var
-		if (this.clearOnShrink && newLines.length < this.maxLinesRendered && this.overlayStack.length === 0) {
+		if (this.clearOnShrink && realLength < this.maxLinesRendered && this.overlayStack.length === 0) {
 			logRedraw(`clearOnShrink (maxLinesRendered=${this.maxLinesRendered})`);
 			fullRender(true);
 			return;
@@ -1098,13 +1114,16 @@ export class TUI extends Container {
 			return;
 		}
 
-		// All changes are in deleted lines (nothing to render, just clear)
-		if (firstChanged >= newLines.length) {
-			if (this.previousLines.length > newLines.length) {
+		// All changes are in deleted lines (nothing to render, just clear).
+		// Uses realLength so watermark padding doesn't hide a real shrink: with padding,
+		// newLines.length stays at high-water, but firstChanged still lands at where the
+		// real content shrunk to.
+		if (firstChanged >= realLength) {
+			if (this.previousLines.length > realLength) {
 				let buffer = "\x1b[?2026h";
 				buffer += this.deleteChangedKittyImages(firstChanged, lastChanged);
-				// Move to end of new content (clamp to 0 for empty content)
-				const targetRow = Math.max(0, newLines.length - 1);
+				// Move to end of new real content (clamp to 0 for empty content)
+				const targetRow = Math.max(0, realLength - 1);
 				if (targetRow < prevViewportTop) {
 					logRedraw(`deleted lines moved viewport up (${targetRow} < ${prevViewportTop})`);
 					fullRender(true);
@@ -1114,8 +1133,10 @@ export class TUI extends Container {
 				if (lineDiff > 0) buffer += `\x1b[${lineDiff}B`;
 				else if (lineDiff < 0) buffer += `\x1b[${-lineDiff}A`;
 				buffer += "\r";
-				// Clear extra lines without scrolling
-				const extraLines = this.previousLines.length - newLines.length;
+				// Clear extra rows where real content used to be (now padding under watermark,
+				// or actually missing if no watermark). Use prevRealLength - realLength rather
+				// than previousLines.length - newLines.length so padding doesn't mask the shrink.
+				const extraLines = prevRealLength - realLength;
 				if (extraLines > height) {
 					logRedraw(`extraLines > height (${extraLines} > ${height})`);
 					fullRender(true);
@@ -1279,8 +1300,9 @@ export class TUI extends Container {
 		// hardwareCursorRow tracks actual terminal cursor position (for movement)
 		this.cursorRow = Math.max(0, newLines.length - 1);
 		this.hardwareCursorRow = finalCursorRow;
-		// Track terminal's working area (grows but doesn't shrink unless cleared)
-		this.maxLinesRendered = Math.max(this.maxLinesRendered, newLines.length);
+		// Track terminal's working area (grows but doesn't shrink unless cleared).
+		// Tracks real content size so clearOnShrink fires on real shrinks despite padding.
+		this.maxLinesRendered = Math.max(this.maxLinesRendered, realLength);
 		this.previousViewportTop = Math.max(prevViewportTop, finalCursorRow - height + 1);
 
 		// Position hardware cursor for IME
