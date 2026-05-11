@@ -257,6 +257,7 @@ export class TUI extends Container {
 	private clearOnShrink = process.env.PI_CLEAR_ON_SHRINK === "1"; // Clear empty rows when content shrinks (default: off)
 	private maxLinesRendered = 0; // Track terminal's working area (max lines ever rendered)
 	private previousViewportTop = 0; // Track previous viewport top for resize-aware cursor moves
+	private bufferLengthHighWater = 0; // Render pads up to this so viewportTop only grows until next resize
 	private fullRedrawCount = 0;
 	private stopped = false;
 
@@ -968,6 +969,18 @@ export class TUI extends Container {
 
 		// Render all components to get new lines
 		let newLines = this.render(width);
+
+		// Pad newLines up to the high-water buffer length so viewportTop only grows until resize.
+		if (widthChanged || heightChanged) {
+			this.bufferLengthHighWater = 0;
+		}
+		if (newLines.length < this.bufferLengthHighWater) {
+			while (newLines.length < this.bufferLengthHighWater) {
+				newLines.push("");
+			}
+		} else if (newLines.length > this.bufferLengthHighWater) {
+			this.bufferLengthHighWater = newLines.length;
+		}
 
 		// Composite overlays into the rendered lines (before differential compare)
 		if (this.overlayStack.length > 0) {
