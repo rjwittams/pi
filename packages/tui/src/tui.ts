@@ -7,11 +7,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import { isKeyRelease, matchesKey } from "./keys.ts";
+import { type PointerEvent, parsePointerEvent } from "./pointer-events.ts";
 import type { Terminal } from "./terminal.ts";
 import { deleteKittyImage, getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.ts";
 import { extractSegments, normalizeTerminalOutput, sliceByColumn, sliceWithWidth, visibleWidth } from "./utils.ts";
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
+
+function rectContains(rect: OverlayRect, row: number, col: number): boolean {
+	return row >= rect.row && row < rect.row + rect.rows && col >= rect.col && col < rect.col + rect.cols;
+}
 
 function extractKittyImageIds(line: string): number[] {
 	const sequenceStart = line.indexOf(KITTY_SEQUENCE_PREFIX);
@@ -144,6 +149,8 @@ export interface OverlayOptions {
 	width?: SizeValue;
 	/** Minimum width in columns */
 	minWidth?: number;
+	/** Fixed height in rows, or percentage of terminal height (e.g., "50%") */
+	height?: SizeValue;
 	/** Maximum height in rows, or percentage of terminal height (e.g., "50%") */
 	maxHeight?: SizeValue;
 
@@ -185,6 +192,17 @@ export interface OverlayUnfocusOptions {
 /**
  * Handle returned by showOverlay for controlling the overlay
  */
+export interface OverlayRect {
+	/** Zero-based row within the visible terminal viewport. */
+	row: number;
+	/** Zero-based column within the visible terminal viewport. */
+	col: number;
+	/** Height in terminal rows. */
+	rows: number;
+	/** Width in terminal columns. */
+	cols: number;
+}
+
 export interface OverlayHandle {
 	/** Permanently remove the overlay (cannot be shown again) */
 	hide(): void;
@@ -198,7 +216,18 @@ export interface OverlayHandle {
 	unfocus(options?: OverlayUnfocusOptions): void;
 	/** Check if this overlay currently has focus */
 	isFocused(): boolean;
+	/** Get the current visible viewport rect for this overlay, or undefined if hidden/not rendered. */
+	getRect(): OverlayRect | undefined;
+	/** Listen for visible rect changes. Listener is called immediately with current state. */
+	onRectChange(listener: (rect: OverlayRect | undefined) => void): () => void;
+	/** Subscribe to pointer events hit-tested against this overlay's rect. Acquires mouse mode on first subscription. */
+	onPointer(listener: (event: PointerEvent) => void, options?: { wheel?: boolean }): () => void;
 }
+
+type PointerListenerEntry = {
+	listener: (event: PointerEvent) => void;
+	wheel: boolean;
+};
 
 type OverlayStackEntry = {
 	component: Component;
@@ -206,6 +235,10 @@ type OverlayStackEntry = {
 	preFocus: Component | null;
 	hidden: boolean;
 	focusOrder: number;
+	lastRect: OverlayRect | undefined;
+	rectListeners: Set<(rect: OverlayRect | undefined) => void>;
+	pointerListeners: Set<PointerListenerEntry>;
+	mouseModeRelease: (() => void) | undefined;
 };
 
 type OverlayBlockedFocusResume = { status: "restore-overlay" } | { status: "focus-target"; target: Component | null };
@@ -276,15 +309,20 @@ export class TUI extends Container {
 	private renderRequested = false;
 	private renderTimer: NodeJS.Timeout | undefined;
 	private lastRenderAt = 0;
+	private afterNextRenderCallbacks: Array<() => void> = [];
 	private static readonly MIN_RENDER_INTERVAL_MS = 16;
 	private cursorRow = 0; // Logical cursor row (end of rendered content)
 	private hardwareCursorRow = 0; // Actual terminal cursor row (may differ due to IME positioning)
+	private hardwareCursorCol = 0; // Actual terminal cursor column
 	private showHardwareCursor = process.env.PI_HARDWARE_CURSOR === "1";
 	private clearOnShrink = process.env.PI_CLEAR_ON_SHRINK === "1"; // Clear empty rows when content shrinks (default: off)
 	private maxLinesRendered = 0; // Track terminal's working area (max lines ever rendered)
 	private previousViewportTop = 0; // Track previous viewport top for resize-aware cursor moves
 	private fullRedrawCount = 0;
 	private stopped = false;
+	private mouseModeRefcount = 0;
+	private pluginFocused = false;
+	private pluginPreFocus: Component | null = null;
 
 	// Overlay stack for modal components rendered on top of base content
 	private focusOrderCounter = 0;
@@ -301,6 +339,39 @@ export class TUI extends Container {
 
 	get fullRedraws(): number {
 		return this.fullRedrawCount;
+	}
+
+	/** Write opaque terminal bytes without TUI escaping or compositing. */
+	writeRaw(data: string): void {
+		this.terminal.write(data);
+		this.restoreHardwareCursorAfterRawWrite();
+	}
+
+	/**
+	 * Acquire mouse-mode reporting. Refcounted across callers.
+	 * Returns a release function; mouse mode disables when the refcount reaches zero.
+	 * Calling the release function twice is a no-op.
+	 */
+	acquireMouseMode(): () => void {
+		if (this.mouseModeRefcount === 0) {
+			this.terminal.write("\x1b[?1002h\x1b[?1006h");
+		}
+		this.mouseModeRefcount++;
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			if (this.mouseModeRefcount <= 0) return;
+			this.mouseModeRefcount--;
+			if (this.mouseModeRefcount === 0) {
+				this.terminal.write("\x1b[?1002l\x1b[?1006l");
+			}
+		};
+	}
+
+	/** Run a callback after the next render has been flushed to the terminal. */
+	afterNextRender(callback: () => void): void {
+		this.afterNextRenderCallbacks.push(callback);
 	}
 
 	getShowHardwareCursor(): boolean {
@@ -380,6 +451,10 @@ export class TUI extends Container {
 			}
 		}
 
+		if (nextFocus !== previousFocus) {
+			this.pluginFocused = false;
+		}
+		// Clear focused flag on old component
 		if (isFocusable(this.focusedComponent)) {
 			this.focusedComponent.focused = false;
 		}
@@ -453,6 +528,34 @@ export class TUI extends Container {
 	}
 
 	/**
+	 * Set focus to a plugin component (e.g. via click-to-focus) and remember
+	 * the prior focus for Pi-enforced release paths (Esc, click-outside).
+	 *
+	 * Ordering is load-bearing: setFocus is called *first* — it clears
+	 * pluginFocused for any focus change — and pluginFocused is set true
+	 * *after*. Refactors must preserve this order or the flag will be lost.
+	 */
+	private setPluginFocus(component: Component): void {
+		const previous = this.focusedComponent;
+		this.setFocus(component);
+		this.pluginFocused = true;
+		this.pluginPreFocus = previous;
+	}
+
+	/**
+	 * Release plugin focus and restore the previously-focused component.
+	 * Used by Pi-enforced release paths (Esc, click-outside, overlay hide).
+	 * Safe to call when plugin focus is not active — caller must guard
+	 * unless the no-op is intentional. (Currently all callers guard.)
+	 */
+	private releasePluginFocus(): void {
+		const target = this.pluginPreFocus;
+		this.setFocus(target);
+		this.pluginPreFocus = null;
+		this.pluginFocused = false;
+	}
+
+	/**
 	 * Show an overlay component with configurable positioning and sizing.
 	 * Returns a handle to control the overlay's visibility.
 	 */
@@ -463,6 +566,10 @@ export class TUI extends Container {
 			preFocus: this.focusedComponent,
 			hidden: false,
 			focusOrder: ++this.focusOrderCounter,
+			lastRect: undefined,
+			rectListeners: new Set(),
+			pointerListeners: new Set(),
+			mouseModeRelease: undefined,
 		};
 		this.overlayStack.push(entry);
 		// Only focus if overlay is actually visible
@@ -480,6 +587,17 @@ export class TUI extends Container {
 					this.clearOverlayFocusRestoreFor(entry);
 					this.retargetOverlayPreFocus(entry);
 					this.overlayStack.splice(index, 1);
+					this.updateOverlayRect(entry, undefined);
+					// Release plugin focus if this overlay holds it
+					if (this.focusedComponent === entry.component && this.pluginFocused) {
+						this.releasePluginFocus();
+					}
+					// Clean up pointer listeners and mouse mode
+					if (entry.mouseModeRelease) {
+						entry.mouseModeRelease();
+						entry.mouseModeRelease = undefined;
+					}
+					entry.pointerListeners.clear();
 					// Restore focus if this overlay had focus
 					if (this.focusedComponent === component) {
 						const topVisible = this.getTopmostVisibleOverlay();
@@ -495,6 +613,17 @@ export class TUI extends Container {
 				// Update focus when hiding/showing
 				if (hidden) {
 					this.clearOverlayFocusRestoreFor(entry);
+					// Release plugin focus if this overlay holds it
+					if (this.focusedComponent === entry.component && this.pluginFocused) {
+						this.releasePluginFocus();
+					}
+					this.updateOverlayRect(entry, undefined);
+					// Clear pointer listeners when hiding
+					if (entry.mouseModeRelease) {
+						entry.mouseModeRelease();
+						entry.mouseModeRelease = undefined;
+					}
+					entry.pointerListeners.clear();
 					// If this overlay had focus, move focus to next visible or preFocus
 					if (this.focusedComponent === component) {
 						const topVisible = this.getTopmostVisibleOverlay();
@@ -548,6 +677,29 @@ export class TUI extends Container {
 				this.requestRender();
 			},
 			isFocused: () => this.focusedComponent === component,
+			getRect: () => entry.lastRect,
+			onRectChange: (listener) => {
+				entry.rectListeners.add(listener);
+				listener(entry.lastRect);
+				return () => {
+					entry.rectListeners.delete(listener);
+				};
+			},
+			onPointer: (listener: (event: PointerEvent) => void, options?: { wheel?: boolean }): (() => void) => {
+				const ple: PointerListenerEntry = { listener, wheel: options?.wheel === true };
+				entry.pointerListeners.add(ple);
+				if (entry.pointerListeners.size === 1) {
+					entry.mouseModeRelease = this.acquireMouseMode();
+				}
+				return () => {
+					if (!entry.pointerListeners.has(ple)) return;
+					entry.pointerListeners.delete(ple);
+					if (entry.pointerListeners.size === 0 && entry.mouseModeRelease) {
+						entry.mouseModeRelease();
+						entry.mouseModeRelease = undefined;
+					}
+				};
+			},
 		};
 	}
 
@@ -558,6 +710,17 @@ export class TUI extends Container {
 		this.clearOverlayFocusRestoreFor(overlay);
 		this.retargetOverlayPreFocus(overlay);
 		this.overlayStack.pop();
+		// Release plugin focus if this overlay holds it
+		if (this.focusedComponent === overlay.component && this.pluginFocused) {
+			this.releasePluginFocus();
+		}
+		this.updateOverlayRect(overlay, undefined);
+		// Clean up pointer listeners and mouse mode
+		if (overlay.mouseModeRelease) {
+			overlay.mouseModeRelease();
+			overlay.mouseModeRelease = undefined;
+		}
+		overlay.pointerListeners.clear();
 		if (this.focusedComponent === overlay.component) {
 			// Find topmost visible overlay, or fall back to preFocus
 			const topVisible = this.getTopmostVisibleOverlay();
@@ -570,6 +733,17 @@ export class TUI extends Container {
 	/** Check if there are any visible overlays */
 	hasOverlay(): boolean {
 		return this.overlayStack.some((o) => this.isOverlayVisible(o));
+	}
+
+	private updateOverlayRect(entry: OverlayStackEntry, rect: OverlayRect | undefined): void {
+		const prev = entry.lastRect;
+		const changed =
+			prev?.row !== rect?.row || prev?.col !== rect?.col || prev?.rows !== rect?.rows || prev?.cols !== rect?.cols;
+		if (!changed) return;
+		entry.lastRect = rect;
+		for (const listener of entry.rectListeners) {
+			listener(rect);
+		}
 	}
 
 	/** Check if an overlay entry is currently visible */
@@ -591,6 +765,38 @@ export class TUI extends Container {
 			}
 		}
 		return topmost;
+	}
+
+	private dispatchPointerEvent(event: PointerEvent): void {
+		const overlaysByFocus = [...this.overlayStack].sort((a, b) => b.focusOrder - a.focusOrder);
+		for (const entry of overlaysByFocus) {
+			if (entry.hidden) continue;
+			if (!entry.lastRect) continue;
+			if (!rectContains(entry.lastRect, event.row, event.col)) continue;
+			if (entry.pointerListeners.size === 0) continue;
+
+			let delivered = false;
+			for (const ple of entry.pointerListeners) {
+				if (event.type === "wheel" && !ple.wheel) continue;
+				try {
+					ple.listener(event);
+				} catch {
+					// Swallow listener exceptions so a single misbehaving plugin can't
+					// break input dispatch for the rest of the host or other listeners.
+				}
+				delivered = true;
+			}
+			if (!delivered) continue;
+
+			if (event.type === "pointerdown" && this.focusedComponent !== entry.component) {
+				this.setPluginFocus(entry.component);
+			}
+			return;
+		}
+		// No overlay matched. If plugin focus is active, release it on pointerdown.
+		if (event.type === "pointerdown" && this.pluginFocused) {
+			this.releasePluginFocus();
+		}
 	}
 
 	override invalidate(): void {
@@ -632,6 +838,10 @@ export class TUI extends Container {
 
 	stop(): void {
 		this.stopped = true;
+		if (this.mouseModeRefcount > 0) {
+			this.terminal.write("\x1b[?1002l\x1b[?1006l");
+			this.mouseModeRefcount = 0;
+		}
 		if (this.renderTimer) {
 			clearTimeout(this.renderTimer);
 			this.renderTimer = undefined;
@@ -724,6 +934,13 @@ export class TUI extends Container {
 			return;
 		}
 
+		// Parse and dispatch pointer events (SGR mouse)
+		const pointerEvent = parsePointerEvent(data);
+		if (pointerEvent) {
+			this.dispatchPointerEvent(pointerEvent);
+			return;
+		}
+
 		// Global debug key handler (Shift+Ctrl+D)
 		if (matchesKey(data, "shift+ctrl+d") && this.onDebug) {
 			this.onDebug();
@@ -756,6 +973,12 @@ export class TUI extends Container {
 					this.setFocus(restoreState.resume.target);
 				}
 			}
+		}
+
+		// Pi-enforced Esc release: when plugin focus is active, Esc returns to preFocus
+		if (this.pluginFocused && matchesKey(data, "escape") && !isKeyRelease(data)) {
+			this.releasePluginFocus();
+			return;
 		}
 
 		// Pass input to focused component (including Ctrl+C)
@@ -799,7 +1022,7 @@ export class TUI extends Container {
 		overlayHeight: number,
 		termWidth: number,
 		termHeight: number,
-	): { width: number; row: number; col: number; maxHeight: number | undefined } {
+	): { width: number; height: number; row: number; col: number; maxHeight: number | undefined } {
 		const opt = options ?? {};
 
 		// Parse margin (clamp to non-negative)
@@ -825,6 +1048,12 @@ export class TUI extends Container {
 		// Clamp to available space
 		width = Math.max(1, Math.min(width, availWidth));
 
+		// === Resolve height ===
+		let fixedHeight = parseSizeValue(opt.height, termHeight);
+		if (fixedHeight !== undefined) {
+			fixedHeight = Math.max(1, Math.min(fixedHeight, availHeight));
+		}
+
 		// === Resolve maxHeight ===
 		let maxHeight = parseSizeValue(opt.maxHeight, termHeight);
 		// Clamp to available space
@@ -832,8 +1061,9 @@ export class TUI extends Container {
 			maxHeight = Math.max(1, Math.min(maxHeight, availHeight));
 		}
 
-		// Effective overlay height (may be clamped by maxHeight)
-		const effectiveHeight = maxHeight !== undefined ? Math.min(overlayHeight, maxHeight) : overlayHeight;
+		// Effective overlay height (may be clamped by fixed height or maxHeight)
+		const effectiveHeight =
+			fixedHeight ?? (maxHeight !== undefined ? Math.min(overlayHeight, maxHeight) : overlayHeight);
 
 		// === Resolve position ===
 		let row: number;
@@ -891,7 +1121,7 @@ export class TUI extends Container {
 		row = Math.max(marginTop, Math.min(row, termHeight - marginBottom - effectiveHeight));
 		col = Math.max(marginLeft, Math.min(col, termWidth - marginRight - width));
 
-		return { width, row, col, maxHeight };
+		return { width, height: effectiveHeight, row, col, maxHeight };
 	}
 
 	private resolveAnchorRow(anchor: OverlayAnchor, height: number, availHeight: number, marginTop: number): number {
@@ -934,31 +1164,51 @@ export class TUI extends Container {
 		const result = [...lines];
 
 		// Pre-render all visible overlays and calculate positions
-		const rendered: { overlayLines: string[]; row: number; col: number; w: number }[] = [];
+		const rendered: { entry: OverlayStackEntry; overlayLines: string[]; row: number; col: number; w: number }[] = [];
 		let minLinesNeeded = result.length;
 
 		const visibleEntries = this.overlayStack.filter((e) => this.isOverlayVisible(e));
 		visibleEntries.sort((a, b) => a.focusOrder - b.focusOrder);
+		for (const entry of this.overlayStack) {
+			if (!this.isOverlayVisible(entry)) {
+				this.updateOverlayRect(entry, undefined);
+			}
+		}
 		for (const entry of visibleEntries) {
 			const { component, options } = entry;
 
-			// Get layout with height=0 first to determine width and maxHeight
-			// (width and maxHeight don't depend on overlay height)
-			const { width, maxHeight } = this.resolveOverlayLayout(options, 0, termWidth, termHeight);
+			// Get layout with height=0 first to determine width and maxHeight/fixed height.
+			const {
+				width,
+				height: targetHeight,
+				maxHeight,
+			} = this.resolveOverlayLayout(options, 0, termWidth, termHeight);
 
 			// Render component at calculated width
 			let overlayLines = component.render(width);
 
-			// Apply maxHeight if specified
-			if (maxHeight !== undefined && overlayLines.length > maxHeight) {
+			// Apply explicit height or maxHeight if specified
+			if (options?.height !== undefined) {
+				if (overlayLines.length > targetHeight) {
+					overlayLines = overlayLines.slice(0, targetHeight);
+				}
+				while (overlayLines.length < targetHeight) {
+					overlayLines.push("");
+				}
+			} else if (maxHeight !== undefined && overlayLines.length > maxHeight) {
 				overlayLines = overlayLines.slice(0, maxHeight);
 			}
 
 			// Get final row/col with actual overlay height
-			const { row, col } = this.resolveOverlayLayout(options, overlayLines.length, termWidth, termHeight);
+			const {
+				row,
+				col,
+				height: resolvedHeight,
+			} = this.resolveOverlayLayout(options, overlayLines.length, termWidth, termHeight);
 
-			rendered.push({ overlayLines, row, col, w: width });
-			minLinesNeeded = Math.max(minLinesNeeded, row + overlayLines.length);
+			rendered.push({ entry, overlayLines, row, col, w: width });
+			this.updateOverlayRect(entry, { row, col, rows: resolvedHeight, cols: width });
+			minLinesNeeded = Math.max(minLinesNeeded, row + resolvedHeight);
 		}
 
 		// Pad to at least terminal height so overlays have screen-relative positions.
@@ -1182,6 +1432,7 @@ export class TUI extends Container {
 			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 			this.previousWidth = width;
 			this.previousHeight = height;
+			this.flushAfterNextRenderCallbacks();
 		};
 
 		const debugRedraw = process.env.PI_DEBUG_REDRAW === "1";
@@ -1256,6 +1507,7 @@ export class TUI extends Container {
 			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousViewportTop = prevViewportTop;
 			this.previousHeight = height;
+			this.flushAfterNextRenderCallbacks();
 			return;
 		}
 
@@ -1305,6 +1557,7 @@ export class TUI extends Container {
 			this.previousWidth = width;
 			this.previousHeight = height;
 			this.previousViewportTop = prevViewportTop;
+			this.flushAfterNextRenderCallbacks();
 			return;
 		}
 
@@ -1453,6 +1706,16 @@ export class TUI extends Container {
 		this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 		this.previousWidth = width;
 		this.previousHeight = height;
+		this.flushAfterNextRenderCallbacks();
+	}
+
+	private flushAfterNextRenderCallbacks(): void {
+		if (this.afterNextRenderCallbacks.length === 0) return;
+		const callbacks = this.afterNextRenderCallbacks;
+		this.afterNextRenderCallbacks = [];
+		for (const callback of callbacks) {
+			callback();
+		}
 	}
 
 	/**
@@ -1486,6 +1749,21 @@ export class TUI extends Container {
 		}
 
 		this.hardwareCursorRow = targetRow;
+		this.hardwareCursorCol = targetCol;
+		if (this.showHardwareCursor) {
+			this.terminal.showCursor();
+		} else {
+			this.terminal.hideCursor();
+		}
+	}
+
+	private restoreHardwareCursorAfterRawWrite(): void {
+		const screenRow = Math.max(
+			0,
+			Math.min(this.terminal.rows - 1, this.hardwareCursorRow - this.previousViewportTop),
+		);
+		const screenCol = Math.max(0, this.hardwareCursorCol);
+		this.terminal.write(`\x1b[${screenRow + 1};${screenCol + 1}H`);
 		if (this.showHardwareCursor) {
 			this.terminal.showCursor();
 		} else {

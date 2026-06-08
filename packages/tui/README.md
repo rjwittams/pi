@@ -63,6 +63,7 @@ tui.removeChild(component);
 tui.start();
 tui.stop();
 tui.requestRender(); // Request a re-render
+tui.writeRaw("\x1b[31mraw bytes\x1b[0m"); // Opaque terminal bytes
 
 // Global debug key handler (Shift+Ctrl+D)
 tui.onDebug = () => console.log("Debug triggered");
@@ -83,6 +84,8 @@ const handle = tui.showOverlay(component, {
   width: 60,              // Fixed width in columns
   width: "80%",           // Width as percentage of terminal
   minWidth: 40,           // Minimum width floor
+  height: 12,             // Fixed height in rows
+  height: "30%",          // Height as percentage of terminal
   maxHeight: 20,          // Maximum height in rows
   maxHeight: "50%",       // Maximum height as percentage of terminal
 
@@ -120,6 +123,11 @@ handle.unfocus();           // Release focus to normal fallback
 handle.unfocus({ target: baseComponent }); // Release this overlay to a specific component
 handle.unfocus({ target: null });   // Release this overlay and leave focus empty
 handle.isFocused();         // Check if overlay has focus
+handle.getRect();           // Current visible rect: { row, col, rows, cols } (0-based row/col)
+const unsubscribe = handle.onRectChange((rect) => {
+  // Called immediately, then whenever layout or visibility changes
+});
+unsubscribe();
 
 handle.unfocus();
 // Overlay loses focus; TUI falls back to another visible capturing overlay or the previous focus target.
@@ -145,6 +153,7 @@ tui.hasOverlay();
 2. For position: absolute `row`/`col` > percentage `row`/`col` > `anchor`
 3. `margin` clamps final position to stay within terminal bounds
 4. `visible` callback controls whether overlay renders (called each frame)
+5. `height` reserves and pads the overlay to a fixed number of rows when set
 
 ### Component Interface
 

@@ -72,6 +72,7 @@ cp permission-gate.ts ~/.pi/agent/extensions/
 | `custom-header.ts` | Custom header via `ctx.ui.setHeader()` |
 | `overlay-test.ts` | Test overlay compositing with inline text inputs and edge cases |
 | `overlay-qa-tests.ts` | Comprehensive overlay QA tests: anchors, margins, stacking, overflow, animation |
+| `terminal-surface-demo.ts` | Demonstrates raw Kitty image bytes drawn inside a normal Pi overlay using overlay rect geometry |
 | `doom-overlay/` | DOOM game running as an overlay at 35 FPS (demonstrates real-time game rendering) |
 | `shutdown-command.ts` | Adds `/quit` command demonstrating `ctx.shutdown()` |
 | `reload-runtime.ts` | Adds `/reload-runtime` and `reload_runtime` tool showing safe reload flow |

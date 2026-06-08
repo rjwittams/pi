@@ -29,6 +29,19 @@ class EmptyContent implements Component {
 	invalidate(): void {}
 }
 
+class MutableContent implements Component {
+	lines: string[];
+	constructor(lines: string[]) {
+		this.lines = lines;
+	}
+
+	render(): string[] {
+		return this.lines;
+	}
+
+	invalidate(): void {}
+}
+
 async function renderAndFlush(tui: TUI, terminal: VirtualTerminal): Promise<void> {
 	tui.requestRender(true);
 	await new Promise<void>((resolve) => process.nextTick(resolve));
@@ -36,6 +49,102 @@ async function renderAndFlush(tui: TUI, terminal: VirtualTerminal): Promise<void
 }
 
 describe("TUI overlay options", () => {
+	describe("geometry and sizing", () => {
+		it("should report overlay rects and update them on resize", async () => {
+			const terminal = new VirtualTerminal(80, 24);
+			const tui = new TUI(terminal);
+			const overlay = new StaticOverlay(["surface"]);
+			const seen: Array<{ row: number; col: number; rows: number; cols: number } | undefined> = [];
+
+			tui.addChild(new EmptyContent());
+			const handle = tui.showOverlay(overlay, { anchor: "top-left", width: 20, height: 4 });
+			handle.onRectChange((rect) => seen.push(rect));
+			tui.start();
+			await renderAndFlush(tui, terminal);
+
+			assert.deepStrictEqual(handle.getRect(), { row: 0, col: 0, rows: 4, cols: 20 });
+
+			terminal.resize(100, 30);
+			await renderAndFlush(tui, terminal);
+			assert.deepStrictEqual(handle.getRect(), { row: 0, col: 0, rows: 4, cols: 20 });
+			assert.ok(
+				seen.some((rect) => rect?.rows === 4 && rect?.cols === 20),
+				"should emit visible rect",
+			);
+
+			handle.setHidden(true);
+			assert.strictEqual(handle.getRect(), undefined);
+			assert.strictEqual(seen.at(-1), undefined);
+
+			handle.setHidden(false);
+			await renderAndFlush(tui, terminal);
+			assert.deepStrictEqual(handle.getRect(), { row: 0, col: 0, rows: 4, cols: 20 });
+
+			handle.hide();
+			assert.strictEqual(handle.getRect(), undefined);
+			assert.strictEqual(seen.at(-1), undefined);
+			tui.stop();
+		});
+
+		it("should pad overlays to an explicit height", async () => {
+			const terminal = new VirtualTerminal(40, 10);
+			const tui = new TUI(terminal);
+			const overlay = new StaticOverlay(["BOX"]);
+
+			tui.addChild(new EmptyContent());
+			tui.showOverlay(overlay, { anchor: "top-left", width: 10, height: 3 });
+			tui.start();
+			await renderAndFlush(tui, terminal);
+
+			const viewport = terminal.getViewport().slice(0, 3);
+			assert.ok(viewport[0]?.startsWith("BOX"));
+			assert.match(viewport[1] ?? "", /^\s*$/);
+			assert.match(viewport[2] ?? "", /^\s*$/);
+			tui.stop();
+		});
+
+		it("should run after-next-render callbacks when rendered output is unchanged", async () => {
+			const terminal = new VirtualTerminal(40, 10);
+			const tui = new TUI(terminal);
+			const content = new MutableContent(["A"]);
+
+			tui.addChild(content);
+			tui.start();
+			await renderAndFlush(tui, terminal);
+
+			let called = false;
+			tui.afterNextRender(() => {
+				called = true;
+			});
+			tui.requestRender();
+			await terminal.waitForRender();
+
+			assert.strictEqual(called, true);
+			tui.stop();
+		});
+
+		it("should run after-next-render callbacks when render only deletes lines", async () => {
+			const terminal = new VirtualTerminal(40, 10);
+			const tui = new TUI(terminal);
+			const content = new MutableContent(["A", "B"]);
+
+			tui.addChild(content);
+			tui.start();
+			await renderAndFlush(tui, terminal);
+
+			let called = false;
+			content.lines = ["A"];
+			tui.afterNextRender(() => {
+				called = true;
+			});
+			tui.requestRender();
+			await terminal.waitForRender();
+
+			assert.strictEqual(called, true);
+			tui.stop();
+		});
+	});
+
 	describe("width overflow protection", () => {
 		it("should truncate overlay lines that exceed declared width", async () => {
 			const terminal = new VirtualTerminal(80, 24);

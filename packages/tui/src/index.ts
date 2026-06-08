@@ -57,6 +57,8 @@ export {
 	parseKey,
 	setKittyProtocolActive,
 } from "./keys.ts";
+// Pointer event parsing
+export { type PointerEvent, parsePointerEvent } from "./pointer-events.ts";
 // Input buffering for batch splitting
 export { StdinBuffer, type StdinBufferEventMap, type StdinBufferOptions } from "./stdin-buffer.ts";
 // Terminal interface and implementations
@@ -99,6 +101,7 @@ export {
 	type OverlayHandle,
 	type OverlayMargin,
 	type OverlayOptions,
+	type OverlayRect,
 	type OverlayUnfocusOptions,
 	type SizeValue,
 	TUI,
