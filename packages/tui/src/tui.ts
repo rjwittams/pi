@@ -198,6 +198,11 @@ export interface SurfaceRect {
 	rows: number;
 	/** Visible column count. */
 	cols: number;
+	/**
+	 * Total unclipped row count of the component (may exceed `rows` when the component
+	 * is height-clamped or partially scrolled off screen).
+	 */
+	totalRows: number;
 }
 
 /** Backwards-compatible alias for code referring to the v1 name. */
@@ -328,6 +333,23 @@ export class Container implements Component {
 	getChildOffset(child: Component): { startLine: number; lineCount: number } | undefined {
 		return this.childOffsets.get(child);
 	}
+
+	/**
+	 * Iterates this container's rendered children, invoking `visitor` once per child
+	 * with its start line and line count from the most recent render. Children that
+	 * have no recorded offset (i.e., were not part of the most recent render) are skipped.
+	 *
+	 * This is the encapsulated iteration protocol used by `TUI.trackComponent`'s walk.
+	 * External code should prefer this over reading `children` and calling `getChildOffset`
+	 * directly.
+	 */
+	forEachChild(visitor: (child: Component, startLine: number, lineCount: number) => void): void {
+		for (const child of this.children) {
+			const offset = this.childOffsets.get(child);
+			if (offset === undefined) continue;
+			visitor(child, offset.startLine, offset.lineCount);
+		}
+	}
 }
 
 /**
@@ -348,6 +370,7 @@ export class TUI extends Container {
 	private renderTimer: NodeJS.Timeout | undefined;
 	private lastRenderAt = 0;
 	private afterNextRenderCallbacks: Array<() => void> = [];
+	private pendingOverlayRectFires: Array<() => void> = [];
 	private static readonly MIN_RENDER_INTERVAL_MS = 16;
 	private cursorRow = 0; // Logical cursor row (end of rendered content)
 	private hardwareCursorRow = 0; // Actual terminal cursor row (may differ due to IME positioning)
@@ -356,6 +379,9 @@ export class TUI extends Container {
 	private clearOnShrink = process.env.PI_CLEAR_ON_SHRINK === "1"; // Clear empty rows when content shrinks (default: off)
 	private maxLinesRendered = 0; // Track terminal's working area (max lines ever rendered)
 	private previousViewportTop = 0; // Track previous viewport top for resize-aware cursor moves
+	private lastRenderBranch = "init";
+	private bufferLengthHighWater = 0; // Render pads up to this so viewportTop only grows until next resize
+	private previousRealLength = 0; // Last render's unpadded line count (for shrink-detection)
 	private fullRedrawCount = 0;
 	private stopped = false;
 	private mouseModeRefcount = 0;
@@ -367,6 +393,17 @@ export class TUI extends Container {
 	private focusOrderCounter = 0;
 	private overlayStack: OverlayStackEntry[] = [];
 	private overlayFocusRestore: OverlayFocusRestoreState = { status: "inactive" };
+
+	// Component rect tracking: maps tracked components to their listener + last rect
+	private componentLabels = new WeakMap<Component, number>();
+	private componentLabelCounter = 0;
+	private trackedComponents = new Map<
+		Component,
+		{
+			listener: (rect: SurfaceRect | undefined) => void;
+			lastRect: SurfaceRect | undefined;
+		}
+	>();
 
 	constructor(terminal: Terminal, showHardwareCursor?: boolean) {
 		super();
@@ -383,6 +420,17 @@ export class TUI extends Container {
 	/** Index of the first visible buffer line in the current viewport. */
 	get viewportTop(): number {
 		return Math.max(0, this.previousLines.length - this.terminal.rows);
+	}
+
+	/**
+	 * The viewport top the renderer last actually applied. Differs from `viewportTop`
+	 * (live, recomputed from current `previousLines.length`) when the differential
+	 * render path has not yet reconciled a shrink — text on screen is positioned per
+	 * this value, so consumers computing screen rects for content that must align with
+	 * rendered text should use this, not `viewportTop`.
+	 */
+	get renderedViewportTop(): number {
+		return this.previousViewportTop;
 	}
 
 	/** Write opaque terminal bytes without TUI escaping or compositing. */
@@ -588,6 +636,38 @@ export class TUI extends Container {
 	 */
 	setInlinePointerDispatcher(dispatcher: ((event: PointerEvent) => boolean) | undefined): void {
 		this.inlinePointerDispatcher = dispatcher;
+	}
+
+	/**
+	 * Register a component for rect tracking. The listener fires via
+	 * `afterNextRender` whenever the rect changes (field-by-field diff). On the
+	 * first render after registration, if the component is in the tree, the
+	 * listener fires once with the computed rect (undefined → defined is a
+	 * change). Returns an unregister thunk; safe to call repeatedly (idempotent).
+	 * Calling `trackComponent` again for the same component replaces the previous
+	 * registration; the previous unregister thunk remains safe to call (it becomes
+	 * a no-op via identity check).
+	 *
+	 * Tracked components are resolved by walking `Container.children` from the
+	 * TUI root via `Container.forEachChild`; descendants reachable only outside
+	 * that protocol (e.g., rendered "manually" inside a non-Container's render
+	 * output) are not trackable.
+	 *
+	 * This is an internal-ish API for handle implementations (`OverlayHandle`,
+	 * `MessageHandle`). Plugins consume rect updates via the handle's own
+	 * `onRectChange`, which performs synchronous initial delivery.
+	 */
+	trackComponent(component: Component, listener: (rect: SurfaceRect | undefined) => void): () => void {
+		const entry = { listener, lastRect: undefined as SurfaceRect | undefined };
+		this.trackedComponents.set(component, entry);
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			if (this.trackedComponents.get(component) === entry) {
+				this.trackedComponents.delete(component);
+			}
+		};
 	}
 
 	/**
@@ -803,12 +883,27 @@ export class TUI extends Container {
 	private updateOverlayRect(entry: OverlayStackEntry, rect: OverlayRect | undefined): void {
 		const prev = entry.lastRect;
 		const changed =
-			prev?.row !== rect?.row || prev?.col !== rect?.col || prev?.rows !== rect?.rows || prev?.cols !== rect?.cols;
+			prev?.row !== rect?.row ||
+			prev?.col !== rect?.col ||
+			prev?.rows !== rect?.rows ||
+			prev?.cols !== rect?.cols ||
+			prev?.totalRows !== rect?.totalRows;
 		if (!changed) return;
+		this.rectDebug("overlay-rect", {
+			componentLabel: this.componentLabel(entry.component),
+			nextRect: rect === undefined ? null : rect,
+			prevRect: prev === undefined ? null : prev,
+		});
 		entry.lastRect = rect;
-		for (const listener of entry.rectListeners) {
-			listener(rect);
-		}
+		// Listeners fire from flushAfterNextRenderCallbacks (after the terminal
+		// write phase, so writeRaw is safe; before the afterNextRender snapshot,
+		// so any scheduleDraw the listener queues lands in the same drain).
+		const listeners = Array.from(entry.rectListeners);
+		this.pendingOverlayRectFires.push(() => {
+			for (const listener of listeners) {
+				listener(rect);
+			}
+		});
 	}
 
 	/** Check if an overlay entry is currently visible */
@@ -1258,14 +1353,19 @@ export class TUI extends Container {
 
 			// Render component at calculated width
 			let overlayLines = component.render(width);
+			const rawLineCount = overlayLines.length;
 
 			// Apply explicit height or maxHeight if specified
 			if (options?.height !== undefined) {
 				if (overlayLines.length > targetHeight) {
 					overlayLines = overlayLines.slice(0, targetHeight);
 				}
-				while (overlayLines.length < targetHeight) {
-					overlayLines.push("");
+				if (overlayLines.length < targetHeight) {
+					// Make a copy before mutating to avoid modifying component's output
+					overlayLines = [...overlayLines];
+					while (overlayLines.length < targetHeight) {
+						overlayLines.push("");
+					}
 				}
 			} else if (maxHeight !== undefined && overlayLines.length > maxHeight) {
 				overlayLines = overlayLines.slice(0, maxHeight);
@@ -1279,7 +1379,7 @@ export class TUI extends Container {
 			} = this.resolveOverlayLayout(options, overlayLines.length, termWidth, termHeight);
 
 			rendered.push({ entry, overlayLines, row, col, w: width });
-			this.updateOverlayRect(entry, { row, col, rows: resolvedHeight, cols: width });
+			this.updateOverlayRect(entry, { row, col, rows: resolvedHeight, cols: width, totalRows: rawLineCount });
 			minLinesNeeded = Math.max(minLinesNeeded, row + resolvedHeight);
 		}
 
@@ -1464,6 +1564,23 @@ export class TUI extends Container {
 
 		// Render all components to get new lines
 		let newLines = this.render(width);
+		const realLength = newLines.length;
+		const prevRealLength = this.previousRealLength;
+		this.previousRealLength = realLength;
+
+		// Pad newLines up to the high-water buffer length so viewportTop only grows
+		// until resize. Reset on resize; the shrink-detection paths below use realLength
+		// so they fire on real shrinks regardless of the padding.
+		if (widthChanged || heightChanged) {
+			this.bufferLengthHighWater = 0;
+		}
+		if (newLines.length < this.bufferLengthHighWater) {
+			while (newLines.length < this.bufferLengthHighWater) {
+				newLines.push("");
+			}
+		} else if (newLines.length > this.bufferLengthHighWater) {
+			this.bufferLengthHighWater = newLines.length;
+		}
 
 		// Composite overlays into the rendered lines (before differential compare)
 		if (this.overlayStack.length > 0) {
@@ -1477,6 +1594,15 @@ export class TUI extends Container {
 
 		// Helper to clear scrollback and viewport and render all new lines
 		const fullRender = (clear: boolean): void => {
+			// A clearing redraw rebuilds the screen from scratch; the watermark cannot pin
+			// a viewport position that no longer matches the new content. Release it and
+			// emit only the real lines so the natural viewport reflects the actual buffer.
+			// Skip when overlays are active: compositeOverlays grows newLines past
+			// realLength to place overlay content; truncating would strip the overlays.
+			if (clear && newLines.length > realLength && this.overlayStack.length === 0) {
+				this.bufferLengthHighWater = realLength;
+				newLines.length = realLength;
+			}
 			this.fullRedrawCount += 1;
 			let buffer = "\x1b[?2026h"; // Begin synchronized output
 			if (clear) {
@@ -1491,11 +1617,12 @@ export class TUI extends Container {
 			this.terminal.write(buffer);
 			this.cursorRow = Math.max(0, newLines.length - 1);
 			this.hardwareCursorRow = this.cursorRow;
-			// Reset max lines when clearing, otherwise track growth
+			// Reset max real lines when clearing, otherwise track growth.
+			// Tracks real content size so clearOnShrink fires on real shrinks despite padding.
 			if (clear) {
-				this.maxLinesRendered = newLines.length;
+				this.maxLinesRendered = realLength;
 			} else {
-				this.maxLinesRendered = Math.max(this.maxLinesRendered, newLines.length);
+				this.maxLinesRendered = Math.max(this.maxLinesRendered, realLength);
 			}
 			const bufferLength = Math.max(height, newLines.length);
 			this.previousViewportTop = Math.max(0, bufferLength - height);
@@ -1518,6 +1645,7 @@ export class TUI extends Container {
 		// First render - just output everything without clearing (assumes clean screen)
 		if (this.previousLines.length === 0 && !widthChanged && !heightChanged) {
 			logRedraw("first render");
+			this.lastRenderBranch = "first-render";
 			fullRender(false);
 			return;
 		}
@@ -1525,6 +1653,7 @@ export class TUI extends Container {
 		// Width changes always need a full re-render because wrapping changes.
 		if (widthChanged) {
 			logRedraw(`terminal width changed (${this.previousWidth} -> ${width})`);
+			this.lastRenderBranch = "width-changed";
 			fullRender(true);
 			return;
 		}
@@ -1534,6 +1663,7 @@ export class TUI extends Container {
 		// In that environment, a full redraw causes the entire history to replay on every toggle.
 		if (heightChanged && !isTermuxSession()) {
 			logRedraw(`terminal height changed (${this.previousHeight} -> ${height})`);
+			this.lastRenderBranch = "height-changed";
 			fullRender(true);
 			return;
 		}
@@ -1541,8 +1671,9 @@ export class TUI extends Container {
 		// Content shrunk below the working area and no overlays - re-render to clear empty rows
 		// (overlays need the padding, so only do this when no overlays are active)
 		// Configurable via setClearOnShrink() or PI_CLEAR_ON_SHRINK=0 env var
-		if (this.clearOnShrink && newLines.length < this.maxLinesRendered && this.overlayStack.length === 0) {
+		if (this.clearOnShrink && realLength < this.maxLinesRendered && this.overlayStack.length === 0) {
 			logRedraw(`clearOnShrink (maxLinesRendered=${this.maxLinesRendered})`);
+			this.lastRenderBranch = "clearOnShrink";
 			fullRender(true);
 			return;
 		}
@@ -1579,19 +1710,24 @@ export class TUI extends Container {
 			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousViewportTop = prevViewportTop;
 			this.previousHeight = height;
+			this.lastRenderBranch = "no-changes";
 			this.flushAfterNextRenderCallbacks();
 			return;
 		}
 
-		// All changes are in deleted lines (nothing to render, just clear)
-		if (firstChanged >= newLines.length) {
-			if (this.previousLines.length > newLines.length) {
+		// All changes are in deleted lines (nothing to render, just clear).
+		// Uses realLength so watermark padding doesn't hide a real shrink: with padding,
+		// newLines.length stays at high-water, but firstChanged still lands at where the
+		// real content shrunk to.
+		if (firstChanged >= realLength) {
+			if (this.previousLines.length > realLength) {
 				let buffer = "\x1b[?2026h";
 				buffer += this.deleteChangedKittyImages(firstChanged, lastChanged);
-				// Move to end of new content (clamp to 0 for empty content)
-				const targetRow = Math.max(0, newLines.length - 1);
+				// Move to end of new real content (clamp to 0 for empty content)
+				const targetRow = Math.max(0, realLength - 1);
 				if (targetRow < prevViewportTop) {
 					logRedraw(`deleted lines moved viewport up (${targetRow} < ${prevViewportTop})`);
+					this.lastRenderBranch = "deleted-lines-fullrender";
 					fullRender(true);
 					return;
 				}
@@ -1599,10 +1735,13 @@ export class TUI extends Container {
 				if (lineDiff > 0) buffer += `\x1b[${lineDiff}B`;
 				else if (lineDiff < 0) buffer += `\x1b[${-lineDiff}A`;
 				buffer += "\r";
-				// Clear extra lines without scrolling
-				const extraLines = this.previousLines.length - newLines.length;
+				// Clear extra rows where real content used to be (now padding under watermark,
+				// or actually missing if no watermark). Use prevRealLength - realLength rather
+				// than previousLines.length - newLines.length so padding doesn't mask the shrink.
+				const extraLines = prevRealLength - realLength;
 				if (extraLines > height) {
 					logRedraw(`extraLines > height (${extraLines} > ${height})`);
+					this.lastRenderBranch = "deleted-lines-fullrender";
 					fullRender(true);
 					return;
 				}
@@ -1629,6 +1768,7 @@ export class TUI extends Container {
 			this.previousWidth = width;
 			this.previousHeight = height;
 			this.previousViewportTop = prevViewportTop;
+			this.lastRenderBranch = "deleted-lines-only";
 			this.flushAfterNextRenderCallbacks();
 			return;
 		}
@@ -1637,6 +1777,7 @@ export class TUI extends Container {
 		// If the first changed line is above the previous viewport, we need a full redraw.
 		if (firstChanged < prevViewportTop) {
 			logRedraw(`firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
+			this.lastRenderBranch = "differential-fullrender";
 			fullRender(true);
 			return;
 		}
@@ -1767,8 +1908,9 @@ export class TUI extends Container {
 		// hardwareCursorRow tracks actual terminal cursor position (for movement)
 		this.cursorRow = Math.max(0, newLines.length - 1);
 		this.hardwareCursorRow = finalCursorRow;
-		// Track terminal's working area (grows but doesn't shrink unless cleared)
-		this.maxLinesRendered = Math.max(this.maxLinesRendered, newLines.length);
+		// Track terminal's working area (grows but doesn't shrink unless cleared).
+		// Tracks real content size so clearOnShrink fires on real shrinks despite padding.
+		this.maxLinesRendered = Math.max(this.maxLinesRendered, realLength);
 		this.previousViewportTop = Math.max(prevViewportTop, finalCursorRow - height + 1);
 
 		// Position hardware cursor for IME
@@ -1778,10 +1920,113 @@ export class TUI extends Container {
 		this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 		this.previousWidth = width;
 		this.previousHeight = height;
+		this.lastRenderBranch = "differential";
 		this.flushAfterNextRenderCallbacks();
 	}
 
+	/**
+	 * After Container render has populated childOffsets across the tree, walk the
+	 * tree once and deliver per-frame rect updates to all tracked components.
+	 * Unvisited tracked components (no longer in the tree) receive `undefined`.
+	 */
+	private updateTrackedRects(): void {
+		if (this.trackedComponents.size === 0) return;
+		const unvisited = new Set(this.trackedComponents.keys());
+		const walk = (container: Container, abs: number): void => {
+			container.forEachChild((child, startLine, lineCount) => {
+				const childAbs = abs + startLine;
+				if (this.trackedComponents.has(child)) {
+					this.deliverTrackedRect(child, childAbs, lineCount);
+					unvisited.delete(child);
+				}
+				if (child instanceof Container) walk(child, childAbs);
+			});
+		};
+		walk(this, 0);
+		for (const stale of unvisited) {
+			this.deliverTrackedRect(stale, undefined, 0);
+		}
+	}
+
+	/**
+	 * Compute the screen rect from absolute buffer offset + line count, diff
+	 * against lastRect, and queue listener fire via afterNextRender on change.
+	 * Passing `undefined` for bufferOffset signals "not in tree" → rect undefined.
+	 */
+	private deliverTrackedRect(component: Component, bufferOffset: number | undefined, lineCount: number): void {
+		const entry = this.trackedComponents.get(component);
+		if (!entry) return;
+		let nextRect: SurfaceRect | undefined;
+		if (bufferOffset !== undefined && lineCount > 0) {
+			// Use renderedViewportTop (where the renderer last actually placed lines),
+			// not live viewportTop (where lines would be after a perfect re-render).
+			// Pi's differential render shrink path can leave the two diverged; using
+			// the rendered value keeps our rect aligned with where text appears.
+			const viewportTop = this.renderedViewportTop;
+			const termRows = this.terminal.rows;
+			const top = bufferOffset - viewportTop;
+			const bottom = top + lineCount;
+			const visTop = Math.max(0, top);
+			const visBottom = Math.min(termRows, bottom);
+			if (visBottom > visTop) {
+				nextRect = {
+					row: visTop,
+					col: 0,
+					rows: visBottom - visTop,
+					cols: this.terminal.columns,
+					totalRows: lineCount,
+				};
+			}
+		}
+		this.rectDebug("track-rect", {
+			componentLabel: this.componentLabel(component),
+			bufferOffset: bufferOffset === undefined ? null : bufferOffset,
+			lineCount,
+			viewportTop: this.viewportTop,
+			renderedViewportTop: this.renderedViewportTop,
+			nextRect: nextRect === undefined ? null : nextRect,
+			prevRect: entry.lastRect === undefined ? null : entry.lastRect,
+		});
+		const prev = entry.lastRect;
+		const changed =
+			!!prev !== !!nextRect ||
+			prev?.row !== nextRect?.row ||
+			prev?.col !== nextRect?.col ||
+			prev?.rows !== nextRect?.rows ||
+			prev?.cols !== nextRect?.cols ||
+			prev?.totalRows !== nextRect?.totalRows;
+		if (!changed) return;
+		entry.lastRect = nextRect;
+		// Fire synchronously. updateTrackedRects runs inside
+		// flushAfterNextRenderCallbacks, which itself runs after doRender's
+		// terminal write phase — so writeRaw from inside a tracked-rect
+		// listener does not interleave with this render's write bytes.
+		// Crucially, firing synchronously here means the listener (which
+		// typically updates plugin state read by drawImage/afterNextRender
+		// callbacks) runs BEFORE the drain processes those callbacks, so
+		// the first paint after a rect change happens in the same cycle
+		// rather than waiting for a subsequent render.
+		entry.listener(nextRect);
+	}
+
 	private flushAfterNextRenderCallbacks(): void {
+		this.updateTrackedRects();
+		if (this.pendingOverlayRectFires.length > 0) {
+			const fires = this.pendingOverlayRectFires;
+			this.pendingOverlayRectFires = [];
+			for (const fire of fires) {
+				fire();
+			}
+		}
+		this.rectDebug("render-end", {
+			branch: this.lastRenderBranch,
+			previousLines: this.previousLines.length,
+			termRows: this.terminal.rows,
+			termCols: this.terminal.columns,
+			viewportTop: this.viewportTop,
+			previousViewportTop: this.previousViewportTop,
+			hardwareCursorRow: this.hardwareCursorRow,
+		});
 		if (this.afterNextRenderCallbacks.length === 0) return;
 		const callbacks = this.afterNextRenderCallbacks;
 		this.afterNextRenderCallbacks = [];
@@ -1827,6 +2072,30 @@ export class TUI extends Container {
 		} else {
 			this.terminal.hideCursor();
 		}
+	}
+
+	private rectDebug(event: string, fields: Record<string, unknown>): void {
+		if (process.env.PI_RECT_DEBUG !== "1") return;
+		const logPath = path.join(os.homedir(), ".pi", "agent", "pi-rect-debug.log");
+		const ts = new Date().toISOString();
+		const body = Object.entries(fields)
+			.map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
+			.join(" ");
+		fs.appendFileSync(logPath, `[${ts}] ${event} ${body}\n`);
+	}
+
+	private componentLabelIndex(component: Component): number {
+		let idx = this.componentLabels.get(component);
+		if (idx === undefined) {
+			idx = this.componentLabelCounter++;
+			this.componentLabels.set(component, idx);
+		}
+		return idx;
+	}
+
+	private componentLabel(component: Component): string {
+		const name = (component as { constructor?: { name?: string } }).constructor?.name ?? "Component";
+		return `${name}#${this.componentLabelIndex(component)}`;
 	}
 
 	private restoreHardwareCursorAfterRawWrite(): void {

@@ -62,11 +62,11 @@ describe("TUI overlay options", () => {
 			tui.start();
 			await renderAndFlush(tui, terminal);
 
-			assert.deepStrictEqual(handle.getRect(), { row: 0, col: 0, rows: 4, cols: 20 });
+			assert.deepStrictEqual(handle.getRect(), { row: 0, col: 0, rows: 4, cols: 20, totalRows: 1 });
 
 			terminal.resize(100, 30);
 			await renderAndFlush(tui, terminal);
-			assert.deepStrictEqual(handle.getRect(), { row: 0, col: 0, rows: 4, cols: 20 });
+			assert.deepStrictEqual(handle.getRect(), { row: 0, col: 0, rows: 4, cols: 20, totalRows: 1 });
 			assert.ok(
 				seen.some((rect) => rect?.rows === 4 && rect?.cols === 20),
 				"should emit visible rect",
@@ -74,14 +74,18 @@ describe("TUI overlay options", () => {
 
 			handle.setHidden(true);
 			assert.strictEqual(handle.getRect(), undefined);
+			// Rect-change listener fires deferred; flush to let it land.
+			await renderAndFlush(tui, terminal);
 			assert.strictEqual(seen.at(-1), undefined);
 
 			handle.setHidden(false);
 			await renderAndFlush(tui, terminal);
-			assert.deepStrictEqual(handle.getRect(), { row: 0, col: 0, rows: 4, cols: 20 });
+			assert.deepStrictEqual(handle.getRect(), { row: 0, col: 0, rows: 4, cols: 20, totalRows: 1 });
 
 			handle.hide();
 			assert.strictEqual(handle.getRect(), undefined);
+			// Rect-change listener fires deferred; flush to let it land.
+			await renderAndFlush(tui, terminal);
 			assert.strictEqual(seen.at(-1), undefined);
 			tui.stop();
 		});

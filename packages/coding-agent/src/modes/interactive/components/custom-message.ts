@@ -23,10 +23,73 @@ class MessageHandleImpl implements MessageHandle {
 	private focusHook: { focus: () => void; unfocus: () => void; isFocused: () => boolean };
 	private tui: TUI | undefined;
 	private mouseModeRelease: (() => void) | undefined;
+	private rectUnregister: (() => void) | undefined;
 
 	constructor(tui: TUI | undefined, focusHook: { focus: () => void; unfocus: () => void; isFocused: () => boolean }) {
 		this.tui = tui;
 		this.focusHook = focusHook;
+	}
+
+	/**
+	 * Connect this handle to a `customComponent` so the TUI delivers rect updates
+	 * here. Must be called once when the customComponent becomes known (after the
+	 * extension's renderer returns it). Calling again with a different component
+	 * unregisters the previous one.
+	 */
+	attachToComponent(component: Component): void {
+		this.rectUnregister?.();
+		this.rectUnregister = undefined;
+		if (!this.tui) return;
+		this.rectUnregister = this.tui.trackComponent(component, (rect) => {
+			const wasVisible = !!this.lastRect;
+			const isVisible = !!rect;
+			this.lastRect = rect;
+			for (const listener of this.rectListeners) {
+				listener(rect);
+			}
+			if (wasVisible && !isVisible && this.focusHook.isFocused()) {
+				// Scrolled fully out of view while focused — release plugin focus.
+				this.focusHook.unfocus();
+			}
+		});
+	}
+
+	/**
+	 * Detach from the currently tracked customComponent, if any. Called when the
+	 * customComponent is being replaced (rebuild) or the handle is being disposed.
+	 */
+	detachFromComponent(): void {
+		this.rectUnregister?.();
+		this.rectUnregister = undefined;
+	}
+
+	/**
+	 * Clear the current rect to `undefined` and notify listeners. Used by
+	 * `CustomMessageComponent.rebuild()` when no customComponent is attached
+	 * (renderer returned undefined or threw) — the surface has no on-screen
+	 * position and listeners need to know.
+	 */
+	clearRect(): void {
+		if (this.lastRect === undefined) return;
+		const wasFocused = this.focusHook.isFocused();
+		this.lastRect = undefined;
+		for (const listener of this.rectListeners) {
+			listener(undefined);
+		}
+		if (wasFocused) {
+			this.focusHook.unfocus();
+		}
+	}
+
+	/** Release all resources held by the handle. */
+	dispose(): void {
+		this.detachFromComponent();
+		if (this.mouseModeRelease) {
+			this.mouseModeRelease();
+			this.mouseModeRelease = undefined;
+		}
+		this.pointerListeners.clear();
+		this.rectListeners.clear();
 	}
 
 	getRect(): SurfaceRect | undefined {
@@ -143,6 +206,7 @@ export class CustomMessageComponent extends Container implements Focusable {
 	private rebuild(): void {
 		// Remove previous content component
 		if (this.customComponent) {
+			this.messageHandle.detachFromComponent();
 			this.removeChild(this.customComponent);
 			this.customComponent = undefined;
 		}
@@ -160,6 +224,7 @@ export class CustomMessageComponent extends Container implements Focusable {
 					// Custom renderer provides its own styled component
 					this.customComponent = component;
 					this.addChild(component);
+					this.messageHandle.attachToComponent(component);
 					return;
 				}
 			} catch {
@@ -167,7 +232,8 @@ export class CustomMessageComponent extends Container implements Focusable {
 			}
 		}
 
-		// Default rendering uses our box
+		// Default rendering — no customComponent on the tree; clear any stale rect.
+		this.messageHandle.clearRect();
 		this.addChild(this.box);
 		this.box.clear();
 

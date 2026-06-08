@@ -70,6 +70,7 @@ describe("Inline rect math", () => {
 				col: 0,
 				rows: visibleRows,
 				cols: terminal.columns,
+				totalRows: childOffset.lineCount,
 			};
 			// Content fits well within the viewport; expect full visibility starting at row 0.
 			assert.strictEqual(screenRow, 0);
