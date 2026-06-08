@@ -697,12 +697,15 @@ export class InteractiveMode {
 		this.ui.addChild(this.widgetContainerBelow);
 		this.ui.addChild(this.footer);
 		this.ui.setFocus(this.editor);
+		this.ui.setDefaultFocus(this.editor);
 
 		this.setupKeyHandlers();
 		this.setupEditorSubmitHandler();
 
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
 		this.ui.start();
+		this.scheduleInlineRectDelivery();
+		this.ui.setInlinePointerDispatcher((event) => this.dispatchInlinePointer(event));
 		this.isInitialized = true;
 
 		// Initialize extensions first so resources are shown before messages
@@ -3096,7 +3099,12 @@ export class InteractiveMode {
 			case "custom": {
 				if (message.display) {
 					const renderer = this.session.extensionRunner.getMessageRenderer(message.customType);
-					const component = new CustomMessageComponent(message, renderer, this.getMarkdownThemeWithSettings());
+					const component = new CustomMessageComponent(
+						message,
+						renderer,
+						this.getMarkdownThemeWithSettings(),
+						this.ui,
+					);
 					component.setExpanded(this.toolOutputExpanded);
 					this.chatContainer.addChild(component);
 				}
@@ -5724,8 +5732,105 @@ export class InteractiveMode {
 			this.unsubscribe();
 		}
 		if (this.isInitialized) {
+			this.ui.setInlinePointerDispatcher(undefined);
 			this.ui.stop();
 			this.isInitialized = false;
 		}
+	}
+
+	private deliverInlineMessageRects(): void {
+		const tui = this.ui;
+		const chatContainerOffset = tui.getChildOffset(this.chatContainer);
+		if (!chatContainerOffset) return;
+		const viewportTop = tui.viewportTop;
+		const termRows = tui.terminal.rows;
+		const termCols = tui.terminal.columns;
+
+		for (const child of this.chatContainer.children) {
+			if (!(child instanceof CustomMessageComponent)) continue;
+			const handle = child.messageHandle;
+			const childOffset = this.chatContainer.getChildOffset(child);
+			const customComponent = child.customComponent;
+			let nextRect: import("@earendil-works/pi-tui").SurfaceRect | undefined;
+
+			if (childOffset && customComponent) {
+				const innerOffset = child.getChildOffset(customComponent);
+				if (innerOffset && innerOffset.lineCount > 0) {
+					const bufferTop = chatContainerOffset.startLine + childOffset.startLine + innerOffset.startLine;
+					const screenRow = bufferTop - viewportTop;
+					let row: number;
+					let visibleRows: number;
+					if (screenRow >= 0) {
+						row = screenRow;
+						visibleRows = Math.min(innerOffset.lineCount, Math.max(0, termRows - row));
+					} else {
+						row = 0;
+						visibleRows = innerOffset.lineCount + screenRow;
+					}
+					if (visibleRows > 0) {
+						nextRect = { row, col: 0, rows: visibleRows, cols: termCols };
+					}
+				}
+			}
+
+			const prev = handle.lastRect;
+			const changed =
+				!!prev !== !!nextRect ||
+				prev?.row !== nextRect?.row ||
+				prev?.col !== nextRect?.col ||
+				prev?.rows !== nextRect?.rows ||
+				prev?.cols !== nextRect?.cols;
+			if (!changed) continue;
+			const wasVisible = !!prev;
+			const isVisible = !!nextRect;
+			handle.lastRect = nextRect;
+			for (const listener of handle.rectListeners) {
+				listener(nextRect);
+			}
+			if (wasVisible && !isVisible && handle.isFocused()) {
+				// Focused inline message scrolled fully out of view — release plugin focus
+				// per the v2 spec's "never locked into a plugin" guarantee.
+				this.ui.setFocus(null);
+			}
+		}
+	}
+
+	private scheduleInlineRectDelivery(): void {
+		this.ui.afterNextRender(() => {
+			this.deliverInlineMessageRects();
+			this.scheduleInlineRectDelivery();
+		});
+	}
+
+	private dispatchInlinePointer(event: import("@earendil-works/pi-tui").PointerEvent): boolean {
+		for (const child of this.chatContainer.children) {
+			if (!(child instanceof CustomMessageComponent)) continue;
+			const handle = child.messageHandle;
+			const rect = handle.lastRect;
+			if (!rect) continue;
+			if (event.row < rect.row || event.row >= rect.row + rect.rows) continue;
+			if (event.col < rect.col || event.col >= rect.col + rect.cols) continue;
+			if (handle.pointerListeners.size === 0) continue;
+
+			let delivered = false;
+			for (const ple of handle.pointerListeners) {
+				if (event.type === "wheel" && !ple.wheel) continue;
+				if (event.type === "pointermove" && event.buttons === 0 && !ple.hover) continue;
+				try {
+					ple.listener(event);
+				} catch {
+					// Swallow listener exceptions so a single misbehaving plugin can't
+					// break input dispatch for the rest of the host or other listeners.
+				}
+				delivered = true;
+			}
+			if (!delivered) continue;
+
+			if (event.type === "pointerdown" && !child.focused) {
+				this.ui.setPluginFocus(child);
+			}
+			return true;
+		}
+		return false;
 	}
 }

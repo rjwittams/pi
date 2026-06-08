@@ -40,6 +40,7 @@ describe("Pi-enforced Esc release for plugin focus", () => {
 		const editor = new FocusableOverlay(["EDITOR"]);
 		tui.addChild(new EmptyContent());
 		tui.setFocus(editor);
+		tui.setDefaultFocus(editor);
 		const overlay = new FocusableOverlay(["OVERLAY"]);
 		tui.start();
 		try {
@@ -80,12 +81,53 @@ describe("Pi-enforced Esc release for plugin focus", () => {
 		}
 	});
 
+	it("Esc with chained plugin focus returns to the root non-plugin component, not to a prior plugin focus", async () => {
+		const terminal = new VirtualTerminal(80, 24);
+		const tui = new TUI(terminal);
+		const editor = new FocusableOverlay(["EDITOR"]);
+		tui.addChild(new EmptyContent());
+		tui.setFocus(editor);
+		tui.setDefaultFocus(editor);
+
+		const overlayA = new FocusableOverlay(["A"]);
+		const overlayB = new FocusableOverlay(["B"]);
+		tui.start();
+		try {
+			const handleA = tui.showOverlay(overlayA, { width: 1, height: 1, anchor: "top-left", nonCapturing: true });
+			const handleB = tui.showOverlay(overlayB, { width: 1, height: 1, anchor: "top-right", nonCapturing: true });
+			await flush(tui, terminal);
+			handleA.onPointer(() => {});
+			handleB.onPointer(() => {});
+
+			// Click A — first plugin focus entry; preFocus should be set to editor
+			terminal.sendInput("\x1b[<0;1;1M");
+			await flush(tui, terminal);
+			assert.strictEqual(overlayA.focused, true);
+
+			// Click B — plugin-to-plugin switch; preFocus must remain editor, not overlayA
+			terminal.sendInput("\x1b[<0;80;1M");
+			await flush(tui, terminal);
+			assert.strictEqual(overlayB.focused, true);
+			assert.strictEqual(overlayA.focused, false);
+
+			// Esc — must return to editor (the root pre-plugin focus), not to overlayA
+			terminal.sendInput("\x1b");
+			await flush(tui, terminal);
+			assert.strictEqual(editor.focused, true, "Esc must return to root non-plugin focus");
+			assert.strictEqual(overlayA.focused, false);
+			assert.strictEqual(overlayB.focused, false);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("Esc released via Kitty CSI-u sequence (\\x1b[27u) also returns focus", async () => {
 		const terminal = new VirtualTerminal(80, 24);
 		const tui = new TUI(terminal);
 		const editor = new FocusableOverlay(["EDITOR"]);
 		tui.addChild(new EmptyContent());
 		tui.setFocus(editor);
+		tui.setDefaultFocus(editor);
 		const overlay = new FocusableOverlay(["OVERLAY"]);
 		tui.start();
 		try {

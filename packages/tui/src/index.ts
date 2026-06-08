@@ -97,6 +97,7 @@ export {
 	CURSOR_MARKER,
 	type Focusable,
 	isFocusable,
+	type MessageHandle,
 	type OverlayAnchor,
 	type OverlayHandle,
 	type OverlayMargin,
@@ -104,6 +105,8 @@ export {
 	type OverlayRect,
 	type OverlayUnfocusOptions,
 	type SizeValue,
+	type SurfaceHandle,
+	type SurfaceRect,
 	TUI,
 } from "./tui.ts";
 // Utilities

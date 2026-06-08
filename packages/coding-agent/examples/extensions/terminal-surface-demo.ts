@@ -9,7 +9,8 @@
  *
  * Usage:
  *   pi --extension packages/coding-agent/examples/extensions/terminal-surface-demo.ts
- *   /terminal-surface-demo
+ *   /terminal-surface-demo          (floating overlay, toggles)
+ *   /terminal-surface-demo inline   (inline message)
  */
 
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
@@ -18,6 +19,8 @@ import {
 	matchesKey,
 	type OverlayHandle,
 	type PointerEvent,
+	type SurfaceHandle,
+	type SurfaceRect,
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
@@ -46,16 +49,27 @@ let activeClose: (() => void) | undefined;
 
 export default function (pi: ExtensionAPI) {
 	pi.registerCommand("terminal-surface-demo", {
-		description: "Show a bordered overlay panel with a Kitty image; exercises pointer events and click-to-focus",
-		handler: async (_args: string, ctx: ExtensionCommandContext) => {
+		description:
+			"Show a bordered overlay panel with a Kitty image; exercises pointer events and click-to-focus. Pass 'inline' to open as an inline message.",
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const mode = args.trim() === "inline" ? "inline" : "floating";
+
+			if (mode === "inline") {
+				pi.sendMessage({
+					customType: "terminal-surface-demo-inline",
+					content: "Surface lab inline",
+					display: true,
+				});
+				return;
+			}
+
+			// Floating mode (existing behaviour)
 			if (activeClose) {
 				activeClose();
 				return;
 			}
 
-			let component: TerminalSurfaceDemoComponent | undefined;
-			let rectUnsubscribe: (() => void) | undefined;
-			let pointerUnsubscribe: (() => void) | undefined;
+			let component: SurfaceLabContent | undefined;
 			const inputUnsubscribe = ctx.ui.onTerminalInput((data) => {
 				if (matchesKey(data, "ctrl+g")) {
 					activeClose?.();
@@ -67,7 +81,7 @@ export default function (pi: ExtensionAPI) {
 			const surfacePromise = ctx.ui.custom<void>(
 				(tui, theme, _keybindings, done) => {
 					activeClose = done;
-					component = new TerminalSurfaceDemoComponent(tui, theme);
+					component = new SurfaceLabContent(tui, theme);
 					return component;
 				},
 				{
@@ -80,8 +94,7 @@ export default function (pi: ExtensionAPI) {
 						nonCapturing: true,
 					},
 					onHandle: (handle: OverlayHandle) => {
-						rectUnsubscribe = handle.onRectChange((rect) => component?.setOverlayRect(rect));
-						pointerUnsubscribe = handle.onPointer((event) => component?.onPointer(event, handle));
+						component?.attachSurface(handle, "floating");
 					},
 				},
 			);
@@ -94,19 +107,26 @@ export default function (pi: ExtensionAPI) {
 				.finally(() => {
 					activeClose = undefined;
 					inputUnsubscribe();
-					rectUnsubscribe?.();
-					pointerUnsubscribe?.();
 				});
 		},
 	});
+
+	pi.registerMessageRenderer("terminal-surface-demo-inline", (_message, options, theme) => {
+		if (!options.tui || !options.handle) return undefined;
+		const component = new SurfaceLabContent(options.tui, theme);
+		component.attachSurface(options.handle, "inline");
+		return component;
+	});
 }
 
-class TerminalSurfaceDemoComponent {
+class SurfaceLabContent {
 	readonly width = PANEL_WIDTH;
 	focused = false;
+	private surface: SurfaceHandle | undefined;
+	private mode: "floating" | "inline" = "floating";
 	private readonly imageId = IMAGE_ID_BASE + Math.floor(Math.random() * 1000);
 	private readonly placementId = PLACEMENT_ID_BASE + Math.floor(Math.random() * 1000);
-	private overlayRect: { row: number; col: number; rows: number; cols: number } | undefined;
+	private surfaceRect: SurfaceRect | undefined;
 	private drawScheduled = false;
 	private markerRow = Math.floor(IMAGE_VIEWPORT.rows / 2);
 	private markerCol = Math.floor(IMAGE_VIEWPORT.cols / 2);
@@ -130,8 +150,15 @@ class TerminalSurfaceDemoComponent {
 		this.theme = theme;
 	}
 
-	setOverlayRect(rect: { row: number; col: number; rows: number; cols: number } | undefined): void {
-		this.overlayRect = rect;
+	attachSurface(surface: SurfaceHandle, mode: "floating" | "inline" = "floating"): void {
+		this.surface = surface;
+		this.mode = mode;
+		surface.onRectChange((rect) => this.setSurfaceRect(rect));
+		surface.onPointer((event) => this.onPointer(event));
+	}
+
+	setSurfaceRect(rect: SurfaceRect | undefined): void {
+		this.surfaceRect = rect;
 		if (!rect) {
 			this.tui.writeRaw(deletePlacement(this.imageId, this.placementId));
 			return;
@@ -139,23 +166,28 @@ class TerminalSurfaceDemoComponent {
 		this.scheduleDraw();
 	}
 
-	render(_width: number): string[] {
-		const w = this.width;
+	render(width: number): string[] {
+		// PANEL_WIDTH is the minimum (matches the floating overlay's configured width).
+		// Inline placement passes the full chat-line width; the panel stretches to fill it
+		// so visible area matches the hit-test rect.
+		const w = Math.max(this.width, width);
 		const innerW = w - 2;
 		const lines: string[] = [];
 		const th = this.theme;
+		const isFocused = this.surface?.isFocused() ?? false;
+		const borderColour = isFocused ? "accent" : "border";
 
 		const pad = (s: string, len: number) => {
 			const truncated = truncateToWidth(s, len, "…");
 			return truncated + " ".repeat(Math.max(0, len - visibleWidth(truncated)));
 		};
-		const row = (content: string) => th.fg("border", "│") + pad(content, innerW) + th.fg("border", "│");
+		const row = (content: string) => th.fg(borderColour, "│") + pad(content, innerW) + th.fg(borderColour, "│");
 
-		lines.push(th.fg("border", `╭${"─".repeat(innerW)}╮`));
+		lines.push(th.fg(borderColour, `╭${"─".repeat(innerW)}╮`));
 		lines.push(row(` ${th.fg("accent", "🖼️ Terminal Surface Demo")}`));
 		lines.push(
 			row(
-				` ${th.fg("dim", `Click or drag inside box to mark; arrows move; Esc releases.${this.focused ? " [focused]" : ""}`)}`,
+				` ${th.fg("dim", `Click or drag inside box to mark; arrows move; Esc releases.${isFocused ? " [focused]" : ""}`)}`,
 			),
 		);
 
@@ -185,9 +217,13 @@ class TerminalSurfaceDemoComponent {
 		const status = this.lastPixel
 			? ` cell(${this.markerCol},${this.markerRow}) → px(${this.lastPixel.x},${this.lastPixel.y})`
 			: ` (click inside the box)`;
+		const helpText =
+			this.mode === "floating"
+				? "Ctrl+G closes; command toggles."
+				: "Esc releases focus; scroll past me to release too.";
 		lines.push(row(` ${th.fg("dim", status)}`));
-		lines.push(row(` ${th.fg("dim", "Ctrl+G closes; command toggles.")}`));
-		lines.push(th.fg("border", `╰${"─".repeat(innerW)}╯`));
+		lines.push(row(` ${th.fg("dim", helpText)}`));
+		lines.push(th.fg(borderColour, `╰${"─".repeat(innerW)}╯`));
 
 		this.scheduleDraw();
 		return lines;
@@ -209,7 +245,7 @@ class TerminalSurfaceDemoComponent {
 		this.tui.requestRender();
 	}
 
-	onPointer(event: PointerEvent, _handle: OverlayHandle): void {
+	onPointer(event: PointerEvent): void {
 		// Accept pointerdown (initial click) and pointermove (drag — only delivered
 		// while a button is held under ?1002h). Hover-motion (no buttons) is not
 		// reported by v1's mouse-mode acquire and is a v2 follow-up.
@@ -245,7 +281,7 @@ class TerminalSurfaceDemoComponent {
 	}
 
 	private imageScreenRect(): { row: number; col: number; rows: number; cols: number } | undefined {
-		const rect = this.overlayRect;
+		const rect = this.surfaceRect;
 		if (!rect || rect.rows < IMAGE_VIEWPORT.rowOffset + IMAGE_VIEWPORT.rows + 2 || rect.cols < PANEL_WIDTH) {
 			return undefined;
 		}

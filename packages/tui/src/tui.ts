@@ -189,44 +189,67 @@ export interface OverlayUnfocusOptions {
 	target: Component | null;
 }
 
-/**
- * Handle returned by showOverlay for controlling the overlay
- */
-export interface OverlayRect {
+export interface SurfaceRect {
 	/** Zero-based row within the visible terminal viewport. */
 	row: number;
 	/** Zero-based column within the visible terminal viewport. */
 	col: number;
-	/** Height in terminal rows. */
+	/** Visible row count (may be smaller than the surface's full row count if partially scrolled). */
 	rows: number;
-	/** Width in terminal columns. */
+	/** Visible column count. */
 	cols: number;
 }
 
-export interface OverlayHandle {
+/** Backwards-compatible alias for code referring to the v1 name. */
+export type OverlayRect = SurfaceRect;
+
+/**
+ * Plugin-facing API for an interactive surface (overlay or inline message).
+ * Subtypes may add lifecycle methods specific to their placement model.
+ */
+export interface SurfaceHandle {
+	/** Get the current visible viewport rect for this surface, or undefined if hidden / not rendered / fully scrolled out. */
+	getRect(): SurfaceRect | undefined;
+	/** Listen for visible rect changes. Listener is called immediately with current state. */
+	onRectChange(listener: (rect: SurfaceRect | undefined) => void): () => void;
+	/** Subscribe to pointer events that hit this surface's rect. */
+	onPointer(listener: (event: PointerEvent) => void, options?: { wheel?: boolean; hover?: boolean }): () => void;
+	/** Focus this surface and bring it to the visual front for keyboard dispatch. */
+	focus(): void;
+	/** Release focus to the previous target. */
+	unfocus(): void;
+	/** Check if this surface currently has focus. */
+	isFocused(): boolean;
+}
+
+/**
+ * Handle returned by showOverlay. Extends SurfaceHandle with overlay-specific
+ * programmatic lifecycle methods.
+ */
+export interface OverlayHandle extends SurfaceHandle {
 	/** Permanently remove the overlay (cannot be shown again) */
 	hide(): void;
 	/** Temporarily hide or show the overlay */
 	setHidden(hidden: boolean): void;
 	/** Check if overlay is temporarily hidden */
 	isHidden(): boolean;
-	/** Focus this overlay and bring it to the visual front */
-	focus(): void;
 	/** Release focus to the next visible capturing overlay or previous target, or to an explicit target when provided */
 	unfocus(options?: OverlayUnfocusOptions): void;
-	/** Check if this overlay currently has focus */
-	isFocused(): boolean;
-	/** Get the current visible viewport rect for this overlay, or undefined if hidden/not rendered. */
-	getRect(): OverlayRect | undefined;
-	/** Listen for visible rect changes. Listener is called immediately with current state. */
-	onRectChange(listener: (rect: OverlayRect | undefined) => void): () => void;
-	/** Subscribe to pointer events hit-tested against this overlay's rect. Acquires mouse mode on first subscription. */
-	onPointer(listener: (event: PointerEvent) => void, options?: { wheel?: boolean }): () => void;
+}
+
+/**
+ * Handle for an inline `registerMessageRenderer` component. Same plugin-facing
+ * surface API as `OverlayHandle` but without programmatic lifecycle methods —
+ * inline messages exist for the lifetime of their chat message.
+ */
+export interface MessageHandle extends SurfaceHandle {
+	// No additions. Inline message lifecycle is owned by the chat layer.
 }
 
 type PointerListenerEntry = {
 	listener: (event: PointerEvent) => void;
 	wheel: boolean;
+	hover: boolean;
 };
 
 type OverlayStackEntry = {
@@ -258,6 +281,7 @@ type OverlayFocusRestorePolicy = "clear" | "preserve";
  */
 export class Container implements Component {
 	children: Component[] = [];
+	private childOffsets = new Map<Component, { startLine: number; lineCount: number }>();
 
 	addChild(component: Component): void {
 		this.children.push(component);
@@ -268,10 +292,12 @@ export class Container implements Component {
 		if (index !== -1) {
 			this.children.splice(index, 1);
 		}
+		this.childOffsets.delete(component);
 	}
 
 	clear(): void {
 		this.children = [];
+		this.childOffsets.clear();
 	}
 
 	invalidate(): void {
@@ -281,14 +307,26 @@ export class Container implements Component {
 	}
 
 	render(width: number): string[] {
+		this.childOffsets.clear();
 		const lines: string[] = [];
 		for (const child of this.children) {
+			const startLine = lines.length;
 			const childLines = child.render(width);
+			this.childOffsets.set(child, { startLine, lineCount: childLines.length });
 			for (const line of childLines) {
 				lines.push(line);
 			}
 		}
 		return lines;
+	}
+
+	/**
+	 * Returns the start line and line count of the given child as recorded by the most recent
+	 * call to `render(width)`. Returns undefined if the child was not part of the most recent
+	 * render. Useful for computing per-child viewport positions in higher-level containers.
+	 */
+	getChildOffset(child: Component): { startLine: number; lineCount: number } | undefined {
+		return this.childOffsets.get(child);
 	}
 }
 
@@ -322,7 +360,8 @@ export class TUI extends Container {
 	private stopped = false;
 	private mouseModeRefcount = 0;
 	private pluginFocused = false;
-	private pluginPreFocus: Component | null = null;
+	private defaultFocus: Component | null = null;
+	private inlinePointerDispatcher: ((event: PointerEvent) => boolean) | undefined = undefined;
 
 	// Overlay stack for modal components rendered on top of base content
 	private focusOrderCounter = 0;
@@ -341,6 +380,11 @@ export class TUI extends Container {
 		return this.fullRedrawCount;
 	}
 
+	/** Index of the first visible buffer line in the current viewport. */
+	get viewportTop(): number {
+		return Math.max(0, this.previousLines.length - this.terminal.rows);
+	}
+
 	/** Write opaque terminal bytes without TUI escaping or compositing. */
 	writeRaw(data: string): void {
 		this.terminal.write(data);
@@ -354,7 +398,7 @@ export class TUI extends Container {
 	 */
 	acquireMouseMode(): () => void {
 		if (this.mouseModeRefcount === 0) {
-			this.terminal.write("\x1b[?1002h\x1b[?1006h");
+			this.terminal.write("\x1b[?1003h\x1b[?1006h");
 		}
 		this.mouseModeRefcount++;
 		let released = false;
@@ -364,7 +408,7 @@ export class TUI extends Container {
 			if (this.mouseModeRefcount <= 0) return;
 			this.mouseModeRefcount--;
 			if (this.mouseModeRefcount === 0) {
-				this.terminal.write("\x1b[?1002l\x1b[?1006l");
+				this.terminal.write("\x1b[?1003l\x1b[?1006l");
 			}
 		};
 	}
@@ -458,19 +502,18 @@ export class TUI extends Container {
 		if (isFocusable(this.focusedComponent)) {
 			this.focusedComponent.focused = false;
 		}
-
 		this.focusedComponent = nextFocus;
 
 		if (isFocusable(nextFocus)) {
 			nextFocus.focused = true;
 		}
-
 		const focusedOverlay = nextFocus
 			? this.overlayStack.find((entry) => entry.component === nextFocus && this.isOverlayVisible(entry))
 			: undefined;
 		if (focusedOverlay) {
 			this.overlayFocusRestore = { status: "eligible", overlay: focusedOverlay };
 		}
+		this.requestRender();
 	}
 
 	private clearOverlayFocusRestore(): void {
@@ -528,30 +571,45 @@ export class TUI extends Container {
 	}
 
 	/**
-	 * Set focus to a plugin component (e.g. via click-to-focus) and remember
-	 * the prior focus for Pi-enforced release paths (Esc, click-outside).
-	 *
-	 * Ordering is load-bearing: setFocus is called *first* — it clears
-	 * pluginFocused for any focus change — and pluginFocused is set true
-	 * *after*. Refactors must preserve this order or the flag will be lost.
+	 * Configure the "default" focused component to return to when plugin focus
+	 * is released (Esc, click-outside, scroll-out, overlay hide). Typically set
+	 * once at startup by the host (e.g. Pi's interactive mode points this at
+	 * the editor/composer). Setting does not change current focus; it only
+	 * affects future release paths.
 	 */
-	private setPluginFocus(component: Component): void {
-		const previous = this.focusedComponent;
-		this.setFocus(component);
-		this.pluginFocused = true;
-		this.pluginPreFocus = previous;
+	setDefaultFocus(component: Component | null): void {
+		this.defaultFocus = component;
 	}
 
 	/**
-	 * Release plugin focus and restore the previously-focused component.
+	 * Register a dispatcher for pointer events that didn't match any overlay. Called after
+	 * the overlay-iteration loop in `dispatchPointerEvent`. Returns true if the dispatcher
+	 * consumed the event (prevents click-outside plugin-focus release). Pass `undefined` to clear.
+	 */
+	setInlinePointerDispatcher(dispatcher: ((event: PointerEvent) => boolean) | undefined): void {
+		this.inlinePointerDispatcher = dispatcher;
+	}
+
+	/**
+	 * Set focus to a plugin component (overlay or inline message). Sets the
+	 * pluginFocused flag so Pi-enforced release paths (Esc, click-outside,
+	 * scroll-out, overlay hide) restore focus to the configured default
+	 * (`setDefaultFocus`). Internal Pi callers and external Pi-extension
+	 * dispatchers both go through this method.
+	 */
+	setPluginFocus(component: Component): void {
+		this.setFocus(component);
+		this.pluginFocused = true;
+	}
+
+	/**
+	 * Release plugin focus and restore the configured default focus target.
 	 * Used by Pi-enforced release paths (Esc, click-outside, overlay hide).
 	 * Safe to call when plugin focus is not active — caller must guard
 	 * unless the no-op is intentional. (Currently all callers guard.)
 	 */
 	private releasePluginFocus(): void {
-		const target = this.pluginPreFocus;
-		this.setFocus(target);
-		this.pluginPreFocus = null;
+		this.setFocus(this.defaultFocus);
 		this.pluginFocused = false;
 	}
 
@@ -685,8 +743,15 @@ export class TUI extends Container {
 					entry.rectListeners.delete(listener);
 				};
 			},
-			onPointer: (listener: (event: PointerEvent) => void, options?: { wheel?: boolean }): (() => void) => {
-				const ple: PointerListenerEntry = { listener, wheel: options?.wheel === true };
+			onPointer: (
+				listener: (event: PointerEvent) => void,
+				options?: { wheel?: boolean; hover?: boolean },
+			): (() => void) => {
+				const ple: PointerListenerEntry = {
+					listener,
+					wheel: options?.wheel === true,
+					hover: options?.hover === true,
+				};
 				entry.pointerListeners.add(ple);
 				if (entry.pointerListeners.size === 1) {
 					entry.mouseModeRelease = this.acquireMouseMode();
@@ -778,6 +843,7 @@ export class TUI extends Container {
 			let delivered = false;
 			for (const ple of entry.pointerListeners) {
 				if (event.type === "wheel" && !ple.wheel) continue;
+				if (event.type === "pointermove" && event.buttons === 0 && !ple.hover) continue;
 				try {
 					ple.listener(event);
 				} catch {
@@ -793,7 +859,13 @@ export class TUI extends Container {
 			}
 			return;
 		}
-		// No overlay matched. If plugin focus is active, release it on pointerdown.
+		// No overlay claimed the event. Try the inline dispatcher.
+		if (this.inlinePointerDispatcher) {
+			if (this.inlinePointerDispatcher(event)) {
+				return;
+			}
+		}
+		// Inline didn't consume (or no dispatcher registered). Release plugin focus on click-outside.
 		if (event.type === "pointerdown" && this.pluginFocused) {
 			this.releasePluginFocus();
 		}
@@ -839,7 +911,7 @@ export class TUI extends Container {
 	stop(): void {
 		this.stopped = true;
 		if (this.mouseModeRefcount > 0) {
-			this.terminal.write("\x1b[?1002l\x1b[?1006l");
+			this.terminal.write("\x1b[?1003l\x1b[?1006l");
 			this.mouseModeRefcount = 0;
 		}
 		if (this.renderTimer) {

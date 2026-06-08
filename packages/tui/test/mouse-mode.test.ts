@@ -4,7 +4,7 @@ import { TUI } from "../src/tui.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
 describe("TUI mouse mode lifecycle", () => {
-	it("enables mouse mode on first acquire and writes ?1002h + ?1006h", () => {
+	it("enables mouse mode on first acquire and writes ?1003h + ?1006h", () => {
 		const terminal = new VirtualTerminal(80, 24);
 		const tui = new TUI(terminal);
 		const written: string[] = [];
@@ -16,7 +16,7 @@ describe("TUI mouse mode lifecycle", () => {
 
 		const release = tui.acquireMouseMode();
 
-		assert.ok(written.some((d) => d.includes("\x1b[?1002h")));
+		assert.ok(written.some((d) => d.includes("\x1b[?1003h")));
 		assert.ok(written.some((d) => d.includes("\x1b[?1006h")));
 
 		release();
@@ -36,7 +36,7 @@ describe("TUI mouse mode lifecycle", () => {
 
 		const release2 = tui.acquireMouseMode();
 
-		assert.ok(!written.some((d) => d.includes("\x1b[?1002h")));
+		assert.ok(!written.some((d) => d.includes("\x1b[?1003h")));
 
 		release1();
 		release2();
@@ -56,10 +56,10 @@ describe("TUI mouse mode lifecycle", () => {
 		};
 
 		release1();
-		assert.ok(!written.some((d) => d.includes("\x1b[?1002l")));
+		assert.ok(!written.some((d) => d.includes("\x1b[?1003l")));
 
 		release2();
-		assert.ok(written.some((d) => d.includes("\x1b[?1002l")));
+		assert.ok(written.some((d) => d.includes("\x1b[?1003l")));
 		assert.ok(written.some((d) => d.includes("\x1b[?1006l")));
 	});
 
@@ -77,7 +77,7 @@ describe("TUI mouse mode lifecycle", () => {
 		};
 
 		release();
-		assert.ok(!written.some((d) => d.includes("\x1b[?1002l")));
+		assert.ok(!written.some((d) => d.includes("\x1b[?1003l")));
 	});
 
 	it("disables mouse mode in stop() when refcount > 0", () => {
@@ -94,7 +94,7 @@ describe("TUI mouse mode lifecycle", () => {
 
 		tui.stop();
 
-		assert.ok(written.some((d) => d.includes("\x1b[?1002l")));
+		assert.ok(written.some((d) => d.includes("\x1b[?1003l")));
 		assert.ok(written.some((d) => d.includes("\x1b[?1006l")));
 	});
 
@@ -112,6 +112,6 @@ describe("TUI mouse mode lifecycle", () => {
 		};
 
 		release();
-		assert.ok(!written.some((d) => d.includes("\x1b[?1002l")));
+		assert.ok(!written.some((d) => d.includes("\x1b[?1003l")));
 	});
 });

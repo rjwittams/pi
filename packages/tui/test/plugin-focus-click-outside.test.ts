@@ -36,6 +36,7 @@ describe("Plugin focus auto-release", () => {
 		const editor = new FocusableOverlay(["EDITOR"]);
 		tui.addChild(new EmptyContent());
 		tui.setFocus(editor);
+		tui.setDefaultFocus(editor);
 		const overlay = new FocusableOverlay(["OVERLAY"]);
 		tui.start();
 		try {
@@ -65,6 +66,7 @@ describe("Plugin focus auto-release", () => {
 		const editor = new FocusableOverlay(["EDITOR"]);
 		tui.addChild(new EmptyContent());
 		tui.setFocus(editor);
+		tui.setDefaultFocus(editor);
 		const overlay = new FocusableOverlay(["OVERLAY"]);
 		tui.start();
 		try {
@@ -90,6 +92,7 @@ describe("Plugin focus auto-release", () => {
 		const editor = new FocusableOverlay(["EDITOR"]);
 		tui.addChild(new EmptyContent());
 		tui.setFocus(editor);
+		tui.setDefaultFocus(editor);
 		const overlay = new FocusableOverlay(["OVERLAY"]);
 		tui.start();
 		try {
@@ -115,6 +118,7 @@ describe("Plugin focus auto-release", () => {
 		const editor = new FocusableOverlay(["EDITOR"]);
 		tui.addChild(new EmptyContent());
 		tui.setFocus(editor);
+		tui.setDefaultFocus(editor);
 		const overlay = new FocusableOverlay(["OVERLAY"]);
 		tui.start();
 		try {

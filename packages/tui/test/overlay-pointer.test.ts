@@ -114,13 +114,13 @@ describe("OverlayHandle.onPointer", () => {
 			const handle = tui.showOverlay(overlay, { width: 5, height: 1, anchor: "top-left" });
 			await flush(tui, terminal);
 
-			assert.ok(!written.some((d) => d.includes("\x1b[?1002h")));
+			assert.ok(!written.some((d) => d.includes("\x1b[?1003h")));
 
 			const off = handle.onPointer(() => {});
-			assert.ok(written.some((d) => d.includes("\x1b[?1002h")));
+			assert.ok(written.some((d) => d.includes("\x1b[?1003h")));
 
 			off();
-			assert.ok(written.some((d) => d.includes("\x1b[?1002l")));
+			assert.ok(written.some((d) => d.includes("\x1b[?1003l")));
 		} finally {
 			tui.stop();
 		}

@@ -35,6 +35,7 @@ import type {
 	EditorComponent,
 	EditorTheme,
 	KeyId,
+	MessageHandle,
 	OverlayHandle,
 	OverlayOptions,
 	TUI,
@@ -1080,6 +1081,10 @@ export interface SessionBeforeTreeResult {
 
 export interface MessageRenderOptions {
 	expanded: boolean;
+	/** TUI instance for renderers that need to schedule redraws or emit terminal control sequences. */
+	tui?: TUI;
+	/** Plugin-facing surface handle for the rendered chat message. Optional — undefined in non-TUI render contexts. */
+	handle?: MessageHandle;
 }
 
 export type MessageRenderer<T = unknown> = (
