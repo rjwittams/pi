@@ -74,6 +74,16 @@ export interface Terminal {
 	// Whether Kitty keyboard protocol is active
 	get kittyProtocolActive(): boolean;
 
+	/**
+	 * Register a handler to be called once, with the 0-indexed terminal row
+	 * where the cursor was at startup. Handler may not fire if the terminal
+	 * does not respond to DSR (\x1b[6n) within a short window; consumers
+	 * should treat absence as "row 0".
+	 *
+	 * Calling this more than once replaces any previously registered handler.
+	 */
+	onInitialCursorRow(handler: (row: number) => void): void;
+
 	// Cursor positioning (relative to current position)
 	moveBy(lines: number): void; // Move cursor up (negative) or down (positive) by N lines
 
@@ -105,6 +115,8 @@ export class ProcessTerminal implements Terminal {
 	private keyboardProtocolPushed = false;
 	private keyboardProtocolNegotiationBuffer = "";
 	private keyboardProtocolBufferFlushTimer?: ReturnType<typeof setTimeout>;
+	private _initialCursorRowHandler?: (row: number) => void;
+	private _initialCursorRowReceived = false;
 	private stdinBuffer?: StdinBuffer;
 	private stdinDataHandler?: (data: string) => void;
 	private progressInterval?: ReturnType<typeof setInterval>;
@@ -129,6 +141,10 @@ export class ProcessTerminal implements Terminal {
 
 	get modifyOtherKeysActive(): boolean {
 		return this._modifyOtherKeysActive;
+	}
+
+	onInitialCursorRow(handler: (row: number) => void): void {
+		this._initialCursorRowHandler = handler;
 	}
 
 	start(onInput: (data: string) => void, onResize: () => void): void {
@@ -177,8 +193,25 @@ export class ProcessTerminal implements Terminal {
 	private setupStdinBuffer(): void {
 		this.stdinBuffer = new StdinBuffer({ timeout: 10 });
 
+		// DSR (Device Status Report) cursor position response pattern: \x1b[<row>;<col>R
+		const cursorReportPattern = /^\x1b\[(\d+);(\d+)R$/;
+
 		// Forward individual sequences to the input handler
 		this.stdinBuffer.on("data", (sequence) => {
+			// Check for DSR cursor position response first (only during the startup
+			// window). Consuming it here keeps it out of the Kitty negotiation buffer.
+			if (!this._initialCursorRowReceived) {
+				const cur = sequence.match(cursorReportPattern);
+				if (cur) {
+					this._initialCursorRowReceived = true;
+					const row = parseInt(cur[1], 10) - 1;
+					if (this._initialCursorRowHandler) {
+						this._initialCursorRowHandler(row);
+					}
+					return; // Don't forward DSR response to input handler.
+				}
+			}
+
 			const negotiationSequence = this.readKeyboardProtocolNegotiationSequence(sequence);
 			if (negotiationSequence === "pending") {
 				this.scheduleKeyboardProtocolNegotiationBufferFlush();
@@ -223,6 +256,17 @@ export class ProcessTerminal implements Terminal {
 		this.keyboardProtocolPushed = true;
 		this.clearKeyboardProtocolNegotiationBuffer();
 		process.stdout.write(KITTY_KEYBOARD_PROTOCOL_QUERY);
+		// Query the startup cursor row (DSR \x1b[6n) so the TUI can anchor its
+		// viewport at a non-zero initial row.
+		process.stdout.write("\x1b[6n");
+		// Stop intercepting DSR-shaped responses after a short window. If the
+		// terminal didn't respond by now, treat the initial cursor row as
+		// unknown (consumers fall back to row 0). This prevents stray future
+		// \x1b[N;MR sequences (e.g. modified function keys) from being
+		// silently consumed as a late DSR response.
+		setTimeout(() => {
+			this._initialCursorRowReceived = true;
+		}, 200);
 	}
 
 	private handleKeyboardProtocolNegotiationSequence(

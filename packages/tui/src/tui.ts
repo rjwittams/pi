@@ -379,6 +379,7 @@ export class TUI extends Container {
 	private clearOnShrink = process.env.PI_CLEAR_ON_SHRINK === "1"; // Clear empty rows when content shrinks (default: off)
 	private maxLinesRendered = 0; // Track terminal's working area (max lines ever rendered)
 	private previousViewportTop = 0; // Track previous viewport top for resize-aware cursor moves
+	private _viewportOriginRow = 0; // Terminal row (0-indexed) where buffer line 0 sits.
 	private lastRenderBranch = "init";
 	private bufferLengthHighWater = 0; // Render pads up to this so viewportTop only grows until next resize
 	private previousRealLength = 0; // Last render's unpadded line count (for shrink-detection)
@@ -431,6 +432,20 @@ export class TUI extends Container {
 	 */
 	get renderedViewportTop(): number {
 		return this.previousViewportTop;
+	}
+
+	/**
+	 * Terminal row (0-indexed) where pi-tui's buffer line 0 currently sits.
+	 * Non-zero when pi launched below the top of the terminal (e.g. with shell
+	 * history above its UI). Drops to 0 once the screen has scrolled enough to
+	 * carry the buffer's top off the visible viewport, or after fullRender(true).
+	 *
+	 * Consumers translating buffer index → terminal row must add this to the
+	 * buffer-relative position. See deliverTrackedRect and
+	 * restoreHardwareCursorAfterRawWrite for the two internal sites that do so.
+	 */
+	get viewportOriginRow(): number {
+		return this._viewportOriginRow;
 	}
 
 	/** Write opaque terminal bytes without TUI escaping or compositing. */
@@ -973,6 +988,9 @@ export class TUI extends Container {
 
 	start(): void {
 		this.stopped = false;
+		this.terminal.onInitialCursorRow((row) => {
+			this._viewportOriginRow = Math.max(0, Math.min(this.terminal.rows - 1, row));
+		});
 		this.terminal.start(
 			(data) => this.handleInput(data),
 			() => this.requestRender(),
@@ -1608,7 +1626,13 @@ export class TUI extends Container {
 			if (clear) {
 				buffer += this.deleteKittyImages(this.previousKittyImageIds);
 				buffer += "\x1b[2J\x1b[H\x1b[3J"; // Clear screen, home, then clear scrollback
+				// Cursor is now at terminal row 0; buffer line 0 will land at row 0.
+				this._viewportOriginRow = 0;
 			}
+			// Capture the viewport origin before scrolling is calculated.
+			// For clear=true paths: we just set _viewportOriginRow to 0 above,
+			// so this captures that. For clear=false: this captures the pre-render value.
+			const viewportOriginAtStart = this._viewportOriginRow;
 			for (let i = 0; i < newLines.length; i++) {
 				if (i > 0) buffer += "\r\n";
 				buffer += newLines[i];
@@ -1626,6 +1650,15 @@ export class TUI extends Container {
 			}
 			const bufferLength = Math.max(height, newLines.length);
 			this.previousViewportTop = Math.max(0, bufferLength - height);
+			// Account for screen scrolling: if the render's \r\n traffic pushed
+			// content past the terminal bottom, the screen scrolled and our
+			// buffer-top moves up accordingly. Closed-form: would-be final row
+			// is viewportOriginRow + newLines.length - 1; excess over
+			// (termRows - 1) is the scroll count.
+			const finalTerminalRowUnclamped = viewportOriginAtStart + Math.max(0, newLines.length - 1);
+			const scrolls = Math.max(0, finalTerminalRowUnclamped - (height - 1));
+			this._viewportOriginRow = Math.max(0, viewportOriginAtStart - scrolls);
+
 			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousLines = newLines;
 			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
@@ -1782,6 +1815,15 @@ export class TUI extends Container {
 			return;
 		}
 
+		// Capture pre-render previousLines.length before any reassignment in this branch.
+		const prevLinesLength = this.previousLines.length;
+
+		// Capture pre-render prevViewportTop before the pre-render scroll block
+		// (around line 1655) may mutate it. The scroll-accounting math at the
+		// end of this branch must use the pre-mutation value so pre-render
+		// scrolls are correctly counted toward the viewportOriginRow decrement.
+		const prevViewportTopAtStart = prevViewportTop;
+
 		// Render from first changed line to end
 		// Build buffer with all updates wrapped in synchronized output
 		let buffer = "\x1b[?2026h"; // Begin synchronized output
@@ -1920,6 +1962,17 @@ export class TUI extends Container {
 		this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 		this.previousWidth = width;
 		this.previousHeight = height;
+		// Scroll bookkeeping for viewportOriginRow. The differential render
+		// emits \r\n line advances during the main write phase (firstChanged
+		// → renderEnd) and during the clear-extra phase (when previousLines
+		// is longer than newLines). The maximum terminal row touched by any
+		// \r\n is the larger of the two end points, translated through
+		// viewportOriginRow. Anything past (termRows - 1) is a scroll.
+		const lastNewlineBufferRow = Math.max(renderEnd, prevLinesLength - 1);
+		const lastNewlineTerminalRow = lastNewlineBufferRow - prevViewportTopAtStart + this._viewportOriginRow;
+		const diffScrolls = Math.max(0, lastNewlineTerminalRow - (height - 1));
+		this._viewportOriginRow = Math.max(0, this._viewportOriginRow - diffScrolls);
+
 		this.lastRenderBranch = "differential";
 		this.flushAfterNextRenderCallbacks();
 	}
@@ -1964,7 +2017,9 @@ export class TUI extends Container {
 			// the rendered value keeps our rect aligned with where text appears.
 			const viewportTop = this.renderedViewportTop;
 			const termRows = this.terminal.rows;
-			const top = bufferOffset - viewportTop;
+			// viewportOriginRow accounts for pi launching below terminal row 0;
+			// without it rect.row would be a buffer index, not a terminal row.
+			const top = bufferOffset - viewportTop + this._viewportOriginRow;
 			const bottom = top + lineCount;
 			const visTop = Math.max(0, top);
 			const visBottom = Math.min(termRows, bottom);
@@ -2101,7 +2156,7 @@ export class TUI extends Container {
 	private restoreHardwareCursorAfterRawWrite(): void {
 		const screenRow = Math.max(
 			0,
-			Math.min(this.terminal.rows - 1, this.hardwareCursorRow - this.previousViewportTop),
+			Math.min(this.terminal.rows - 1, this.hardwareCursorRow - this.previousViewportTop + this._viewportOriginRow),
 		);
 		const screenCol = Math.max(0, this.hardwareCursorCol);
 		this.terminal.write(`\x1b[${screenRow + 1};${screenCol + 1}H`);

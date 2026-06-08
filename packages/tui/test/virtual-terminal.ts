@@ -14,6 +14,8 @@ export class VirtualTerminal implements Terminal {
 	private resizeHandler?: () => void;
 	private _columns: number;
 	private _rows: number;
+	private simulatedInitialCursorRow = 0;
+	private initialCursorRowHandler?: (row: number) => void;
 
 	constructor(columns = 80, rows = 24) {
 		this._columns = columns;
@@ -34,6 +36,11 @@ export class VirtualTerminal implements Terminal {
 		this.resizeHandler = onResize;
 		// Enable bracketed paste mode for consistency with ProcessTerminal
 		this.xterm.write("\x1b[?2004h");
+		if (this.initialCursorRowHandler) {
+			const handler = this.initialCursorRowHandler;
+			const row = this.simulatedInitialCursorRow;
+			process.nextTick(() => handler(row));
+		}
 	}
 
 	async drainInput(_maxMs?: number, _idleMs?: number): Promise<void> {
@@ -111,6 +118,19 @@ export class VirtualTerminal implements Terminal {
 		if (this.inputHandler) {
 			this.inputHandler(data);
 		}
+	}
+
+	/**
+	 * Configure the row (0-indexed) that the simulated terminal will report
+	 * as the initial cursor position. The TUI reads this via the
+	 * Terminal.onInitialCursorRow callback registered in start().
+	 */
+	setSimulatedInitialCursorRow(row: number): void {
+		this.simulatedInitialCursorRow = row;
+	}
+
+	onInitialCursorRow(handler: (row: number) => void): void {
+		this.initialCursorRowHandler = handler;
 	}
 
 	/**
