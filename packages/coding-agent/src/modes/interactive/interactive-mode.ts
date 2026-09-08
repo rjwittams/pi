@@ -118,7 +118,7 @@ import { BranchSummaryMessageComponent } from "./components/branch-summary-messa
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.ts";
 import { CustomEditor } from "./components/custom-editor.ts";
 import { CustomEntryComponent } from "./components/custom-entry.ts";
-import { CustomMessageComponent } from "./components/custom-message.ts";
+import { CustomMessageComponent, CustomMessageContainer } from "./components/custom-message.ts";
 import { DaxnutsComponent } from "./components/daxnuts.ts";
 import { DynamicBorder } from "./components/dynamic-border.ts";
 import { EarendilAnnouncementComponent } from "./components/earendil-announcement.ts";
@@ -153,6 +153,7 @@ import { TreeSelectorComponent } from "./components/tree-selector.ts";
 import { TrustSelectorComponent } from "./components/trust-selector.ts";
 import { UserMessageComponent } from "./components/user-message.ts";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.ts";
+import { createCustomUI } from "./custom-ui.ts";
 import { editInExternalEditor } from "./external-editor.ts";
 import { refreshModelCatalogs } from "./model-catalog-refresh.ts";
 import { getModelSearchText } from "./model-search.ts";
@@ -542,7 +543,7 @@ export class InteractiveMode {
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
 		this.headerContainer = new Container();
 		this.loadedResourcesContainer = new Container();
-		this.chatContainer = new Container();
+		this.chatContainer = new CustomMessageContainer();
 		this.documentContainer = new Container();
 		this.documentContainer.addChild(this.headerContainer);
 		this.documentContainer.addChild(this.loadedResourcesContainer);
@@ -802,7 +803,6 @@ export class InteractiveMode {
 		if (previousUi.hasOverlayEntries) return false;
 
 		const components = [...previousUi.children];
-		const focus = previousUi.getFocusedComponent();
 		const terminal = previousUi.terminal;
 		const showHardwareCursor = previousUi.getShowHardwareCursor();
 		const clearOnShrink = previousUi.getClearOnShrink();
@@ -812,6 +812,8 @@ export class InteractiveMode {
 		}
 
 		previousUi.stop({ preserveScreen: true });
+		// Stopping releases inline surface focus back to the editor.
+		const focus = previousUi.getFocusedComponent();
 		previousUi.setFocus(null);
 		previousUi.clear();
 		if (TuiLayouts.isViewportTUI(previousUi)) previousUi.setLayoutRoot(undefined);
@@ -2239,7 +2241,13 @@ export class InteractiveMode {
 		this.renderWidgets();
 	}
 
+	private readonly customUICancellations = new Set<() => void>();
+
 	private resetExtensionUI(): void {
+		for (const cancel of [...this.customUICancellations]) cancel();
+		for (const child of [...this.chatContainer.children]) {
+			if (child instanceof CustomMessageComponent) child.dispose();
+		}
 		if (this.extensionSelector) {
 			this.hideExtensionSelector();
 		}
@@ -2756,7 +2764,7 @@ export class InteractiveMode {
 		},
 	): Promise<T> {
 		const savedText = this.editor.getText();
-		const isOverlay = options?.overlay ?? false;
+		let mountedComponent: Component | undefined;
 
 		const restoreEditor = () => {
 			this.editorContainer.clear();
@@ -2766,59 +2774,31 @@ export class InteractiveMode {
 			this.ui.requestRender();
 		};
 
-		return new Promise((resolve, reject) => {
-			let component: Component & { dispose?(): void };
-			let closed = false;
-
-			const close = (result: T) => {
-				if (closed) return;
-				closed = true;
-				if (isOverlay) this.ui.hideOverlay();
-				else restoreEditor();
-				// Note: both branches above already call requestRender
-				resolve(result);
-				try {
-					component?.dispose?.();
-				} catch {
-					/* ignore dispose errors */
-				}
-			};
-
-			Promise.resolve(factory(this.ui, theme, this.keybindings, close))
-				.then((c) => {
-					if (closed) return;
-					component = c;
-					if (isOverlay) {
-						// Resolve overlay options - can be static or dynamic function
-						const resolveOptions = (): OverlayOptions | undefined => {
-							if (options?.overlayOptions) {
-								const opts =
-									typeof options.overlayOptions === "function"
-										? options.overlayOptions()
-										: options.overlayOptions;
-								return opts;
-							}
-							// Fallback: use component's width property if available
-							const w = (component as { width?: number }).width;
-							return w ? { width: w } : undefined;
-						};
-						const handle = this.ui.showOverlay(component, resolveOptions());
-						// Expose handle to caller for visibility control
-						options?.onHandle?.(handle);
-					} else {
-						this.disposeActiveSelector();
-						this.editorContainer.clear();
-						this.editorContainer.addChild(component);
-						this.ui.setFocus(component);
-						this.ui.requestRender();
-					}
-				})
-				.catch((err) => {
-					if (closed) return;
-					if (!isOverlay) restoreEditor();
-					reject(err);
-				});
-		});
+		const prompt = createCustomUI(
+			this.ui,
+			theme,
+			this.keybindings,
+			factory,
+			options,
+			(component) => {
+				this.disposeActiveSelector();
+				this.activeSelectorDispose = prompt.cancel;
+				mountedComponent = component;
+				this.editorContainer.clear();
+				this.editorContainer.addChild(component);
+				this.ui.setFocus(component);
+				this.ui.requestRender();
+			},
+			() => {
+				if (mountedComponent && this.editorContainer.children.includes(mountedComponent)) restoreEditor();
+			},
+		);
+		this.customUICancellations.add(prompt.cancel);
+		try {
+			return await prompt.result;
+		} finally {
+			this.customUICancellations.delete(prompt.cancel);
+		}
 	}
 
 	/**
@@ -3600,6 +3580,7 @@ export class InteractiveMode {
 						renderer,
 						this.getMarkdownThemeWithSettings(),
 						this.outputPad,
+						this.ui,
 					);
 					component.setExpanded(this.toolOutputExpanded);
 					this.chatContainer.addChild(component);

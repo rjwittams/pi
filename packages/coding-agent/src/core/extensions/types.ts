@@ -42,6 +42,8 @@ import type {
 	KeyId,
 	OverlayHandle,
 	OverlayOptions,
+	SurfaceHandle,
+	SurfaceOptions,
 	TUI,
 } from "@earendil-works/pi-tui";
 import type { Static, TSchema } from "typebox";
@@ -194,7 +196,12 @@ export interface ExtensionUIContext {
 	/** Set the terminal window/tab title. */
 	setTitle(title: string): void;
 
-	/** Show a custom component with keyboard focus. */
+	/**
+	 * Show a custom component with keyboard focus. Surface registrations made through
+	 * the supplied TUI are owned by this prompt and released before component disposal.
+	 * Rejects if the host cancels the prompt, its overlay is removed, or its renderer stops.
+	 * A component returned after cancellation is disposed without being mounted.
+	 */
 	custom<T>(
 		factory: (
 			tui: TUI,
@@ -1192,10 +1199,20 @@ export interface SessionBeforeTreeResult {
 // Message and Entry Rendering
 // ============================================================================
 
+/** Resources owned by one interactive custom-message renderer invocation. */
+export interface MessageRendererUI {
+	/** Automatically disposed when this rendering is replaced, removed, or its TUI stops. */
+	trackSurface(component: Component, options?: SurfaceOptions): SurfaceHandle;
+	/** Release producers and subscriptions after surface graphics cleanup. */
+	onDispose(callback: () => void): () => void;
+}
+
 export interface MessageRenderOptions {
 	expanded: boolean;
 	/** Horizontal padding configured by the outputPad setting. */
 	outputPad: number;
+	/** Available when attached to an interactive TUI. Recreated after renderer restart. */
+	ui?: MessageRendererUI;
 }
 
 export interface MarkdownTransformContext {
@@ -1214,7 +1231,7 @@ export type MessageRenderer<T = unknown> = (
 	message: CustomMessage<T>,
 	options: MessageRenderOptions,
 	theme: Theme,
-) => Component | undefined;
+) => (Component & { dispose?(): void }) | undefined;
 
 export type EntryRenderer<T = unknown> = (
 	entry: CustomEntry<T>,

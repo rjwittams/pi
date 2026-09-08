@@ -252,6 +252,7 @@ describe("InteractiveMode.showExtensionCustom", () => {
 			editorContainer,
 			keybindings: {},
 			ui,
+			customUICancellations: new Set<() => void>(),
 			disposeActiveSelector: vi.fn(),
 		};
 		const showExtensionCustom = <T>(

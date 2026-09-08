@@ -104,6 +104,7 @@ export type {
 	MarkdownTransformer,
 	MessageEndEvent,
 	MessageRenderer,
+	MessageRendererUI,
 	MessageRenderOptions,
 	MessageStartEvent,
 	MessageUpdateEvent,

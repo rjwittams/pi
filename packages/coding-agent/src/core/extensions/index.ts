@@ -100,6 +100,7 @@ export type {
 	// Events - Message
 	MessageEndEvent,
 	MessageRenderer,
+	MessageRendererUI,
 	MessageRenderOptions,
 	MessageStartEvent,
 	MessageUpdateEvent,
