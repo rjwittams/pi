@@ -1,3 +1,4 @@
+import type { RenderedChild } from "../surface.ts";
 import { type Component, dispatchMouseEvent, type TuiMouseDispatchResult, type TuiMouseEvent } from "../tui.ts";
 import { applyBackgroundToLine, visibleWidth } from "../utils.ts";
 
@@ -19,6 +20,12 @@ export class Box implements Component {
 
 	// Cache for rendered output
 	private cache?: RenderCache;
+	private renderedChildren: RenderedChild[] = [];
+
+	getRenderedChildren(): readonly RenderedChild[] {
+		return this.renderedChildren;
+	}
+
 	private mouseLayout?: { width: number; children: Array<{ component: Component; height: number }> };
 
 	constructor(paddingX = 1, paddingY = 1, bgFn?: (text: string) => string) {
@@ -99,6 +106,7 @@ export class Box implements Component {
 	}
 
 	render(width: number): string[] {
+		this.renderedChildren = [];
 		if (this.children.length === 0) {
 			return [];
 		}
@@ -111,6 +119,15 @@ export class Box implements Component {
 		const mouseChildren: Array<{ component: Component; height: number }> = [];
 		for (const child of this.children) {
 			const lines = child.render(contentWidth);
+			this.renderedChildren.push({
+				component: child,
+				bounds: {
+					x: this.paddingX,
+					y: this.paddingY + childLines.length,
+					width: contentWidth,
+					height: lines.length,
+				},
+			});
 			mouseChildren.push({ component: child, height: lines.length });
 			for (const line of lines) {
 				childLines.push(leftPad + line);

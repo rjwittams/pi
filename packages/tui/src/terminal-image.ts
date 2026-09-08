@@ -407,7 +407,9 @@ export function getKittyImagePlacement(line: string): KittyImagePlacement | unde
 	const controls = match[1]
 		.split(",")
 		.filter((control) => KITTY_PLACEMENT_CONTROL_KEYS.has(control.split("=", 1)[0] ?? ""));
-	const sequence = `\x1b_Ga=p,q=2,${controls.join(",")}\x1b\\`;
+	// Occlusion separates the upload from explicit cropped placements following
+	// it. Cache hits drop that upload without inventing an uncropped placement.
+	const sequence = /(?:^|,)a=t(?:,|$)/.test(match[1]) ? "" : `\x1b_Ga=p,q=2,${controls.join(",")}\x1b\\`;
 	return {
 		imageId: metadata.imageId,
 		transmissionGeneration: metadata.transmissionGeneration,

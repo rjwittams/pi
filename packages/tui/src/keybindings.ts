@@ -5,6 +5,7 @@ import { type KeyId, matchesKey } from "./keys.ts";
  * Downstream packages can add keybindings via declaration merging.
  */
 export interface Keybindings {
+	"tui.surface.releaseFocus": true;
 	// Editor navigation and editing
 	"tui.editor.cursorUp": true;
 	"tui.editor.cursorDown": true;
@@ -69,6 +70,7 @@ export type KeybindingDefinitions = Record<string, KeybindingDefinition>;
 export type KeybindingsConfig = Record<string, KeyId | KeyId[] | undefined>;
 
 export const TUI_KEYBINDINGS = {
+	"tui.surface.releaseFocus": { defaultKeys: "ctrl+g", description: "Return focus from an interactive surface" },
 	"tui.editor.cursorUp": { defaultKeys: "up", description: "Move cursor up" },
 	"tui.editor.cursorDown": { defaultKeys: "down", description: "Move cursor down" },
 	"tui.editor.historyPrevious": {

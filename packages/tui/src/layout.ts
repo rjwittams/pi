@@ -1,6 +1,7 @@
 import type { ScrollView } from "./components/scroll-view.ts";
 import { allocateStackSizes, visibleStackEntries } from "./components/stack.ts";
 import { getLayoutNode } from "./layout-node.ts";
+import { captureRenderedChildren, type RenderedSurfaceChild } from "./surface.ts";
 import { cropKittyImageLine, getKittyImageMetadata, isImageLine } from "./terminal-image.ts";
 import { type Component, CURSOR_MARKER, compositeTuiLine } from "./tui.ts";
 import {
@@ -28,6 +29,7 @@ export interface LayoutBox {
 	parent?: LayoutBox;
 	lines?: readonly string[];
 	lineOffset?: number;
+	renderedChildren?: readonly RenderedSurfaceChild[];
 	scrollView?: ScrollView;
 	scrollContentLines?: readonly string[];
 	layer: number;
@@ -51,8 +53,9 @@ export interface ScrollbarGeometry {
 }
 
 interface LayoutContext {
+	captureSurfaces: boolean;
 	viewport: { width: number; height: number };
-	renderCache: Map<Component, Map<number, string[]>>;
+	renderCache: Map<Component, Map<number, { lines: string[]; children: RenderedSurfaceChild[] }>>;
 	requestRender: () => void;
 	primaryScrollView: ScrollView | undefined;
 }
@@ -69,15 +72,16 @@ function renderCached(context: LayoutContext, component: Component, width: numbe
 	const safeWidth = Math.max(1, Math.floor(width));
 	let widths = context.renderCache.get(component);
 	if (!widths) {
-		widths = new Map<number, string[]>();
+		widths = new Map();
 		context.renderCache.set(component, widths);
 	}
-	let lines = widths.get(safeWidth);
-	if (!lines) {
-		lines = component.render(safeWidth);
-		widths.set(safeWidth, lines);
+	let cached = widths.get(safeWidth);
+	if (!cached) {
+		const lines = component.render(safeWidth);
+		cached = { lines, children: context.captureSurfaces ? captureRenderedChildren(component) : [] };
+		widths.set(safeWidth, cached);
 	}
-	return lines;
+	return cached.lines;
 }
 
 function measureHeight(context: LayoutContext, component: Component, width: number): number {
@@ -129,6 +133,7 @@ function layoutComponent(
 			children: [],
 			lines,
 			lineOffset,
+			renderedChildren: context.renderCache.get(component)?.get(safeWidth)?.children,
 			layer: 0,
 		};
 	}
@@ -381,10 +386,12 @@ export function renderLayoutFrame(
 	width: number,
 	height: number,
 	requestRender: () => void,
+	captureSurfaces = false,
 ): LayoutFrame {
 	const safeWidth = Math.max(1, Math.floor(width));
 	const safeHeight = Math.max(1, Math.floor(height));
 	const context: LayoutContext = {
+		captureSurfaces,
 		viewport: { width: safeWidth, height: safeHeight },
 		renderCache: new Map(),
 		requestRender,

@@ -1,3 +1,13 @@
+export type {
+	RenderedChild,
+	SurfaceGeometry,
+	SurfaceGraphicsInvalidation,
+	SurfaceHandle,
+	SurfaceOptions,
+	SurfaceRect,
+	SurfaceRenderContext,
+} from "./surface.ts";
+
 // Core TUI interfaces and classes
 
 export { Marked, type Token, type Tokens } from "marked";

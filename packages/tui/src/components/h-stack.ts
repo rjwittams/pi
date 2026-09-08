@@ -10,6 +10,7 @@ export class HStack extends Stack {
 	}
 
 	override render(width: number): string[] {
+		this.renderedChildren = [];
 		const safeWidth = Math.max(1, width);
 		const viewport = { width: safeWidth, height: Number.MAX_SAFE_INTEGER };
 		const entries = visibleStackEntries(this.entries, viewport);
@@ -32,6 +33,10 @@ export class HStack extends Stack {
 			let offset = 0;
 			if (this.align === "center") offset = Math.floor((height - lines.length) / 2);
 			else if (this.align === "end") offset = height - lines.length;
+			this.renderedChildren.push({
+				component: entries[index]!.component,
+				bounds: { x, y: offset, width: childWidth, height: lines.length },
+			});
 			for (let row = 0; row < lines.length; row++) {
 				const target = row + offset;
 				if (target < 0 || target >= result.length) continue;

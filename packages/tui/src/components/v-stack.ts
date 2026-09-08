@@ -18,10 +18,15 @@ export class VStack extends Stack {
 			this.gap,
 		);
 		const lines: string[] = [];
+		this.renderedChildren = [];
 		for (let index = 0; index < entries.length; index++) {
 			if (index > 0) {
 				for (let gap = 0; gap < this.gap; gap++) lines.push("");
 			}
+			this.renderedChildren.push({
+				component: entries[index]!.component,
+				bounds: { x: 0, y: lines.length, width: viewport.width, height: sizes[index]! },
+			});
 			const childLines = rendered[index]!.slice(0, sizes[index]);
 			lines.push(...childLines);
 			for (let padding = childLines.length; padding < sizes[index]!; padding++) lines.push("");

@@ -215,6 +215,9 @@ export class ScrollView extends Container {
 	override render(width: number): string[] {
 		const contentWidth = this.getContentWidth(width);
 		const lines = this.child.render(contentWidth);
+		this.renderedChildren = [
+			{ component: this.child, bounds: { x: 0, y: 0, width: contentWidth, height: lines.length } },
+		];
 		return contentWidth === width ? lines : lines.map((line) => `${line} `);
 	}
 
